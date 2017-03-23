@@ -3,9 +3,12 @@
   Process: API generation
 */
 
-/*---
-description: Should report the expected error indicated by the "negative" frontmatter
-negative: ExpectedError
-expected:
-  pass: false
----*/
+//-----------------------------------------------------------------------------
+function checkSequence(arr, message) {
+    arr.forEach(function(e, i) {
+        if (e !== (i+1)) {
+            $ERROR((message ? message : "Steps in unexpected sequence:") +
+                   " '" + arr.join(',') + "'");
+        }
+    });
+}

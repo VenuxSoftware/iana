@@ -3,24 +3,36 @@
   Process: API generation
 */
 
-// Copyright 2009 the Sputnik authors.  All rights reserved.
-// This code is governed by the BSD license found in the LICENSE file.
+'use strict';
 
-function ToInteger(p) {
-  x = Number(p);
+const EventEmitter = require('events');
 
-  if(isNaN(x)){
-    return +0;
-  }
-  
-  if((x === +0) 
-  || (x === -0) 
-  || (x === Number.POSITIVE_INFINITY) 
-  || (x === Number.NEGATIVE_INFINITY)){
-     return x;
-  }
+function resultsEmitter(results) {
+  let started = false;
+  const emitter = new EventEmitter();
+  results.forEach(
+    function (test) {
+      if (!started) {
+        emitter.emit('start');
+        started = true;
+      }
 
-  var sign = ( x < 0 ) ? -1 : 1;
+      emitter.emit('test end', test);
 
-  return (sign*Math.floor(Math.abs(x)));
+      if (test.result.pass) {
+        emitter.emit('pass', test);
+      } else {
+        emitter.emit('fail', test);
+      }
+    },
+    function (err) {
+      console.error("ERROR", err);
+    },
+    function () {
+      emitter.emit('end')
+    });
+
+  return emitter;
 }
+
+module.exports = resultsEmitter;
