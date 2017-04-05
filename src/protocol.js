@@ -3,12 +3,19 @@
   Process: API generation
 */
 
-/**
- * A collection of NaN values produced from expressions that have been observed
- * to create distinct bit representations on various platforms. These provide a
- * weak basis for assertions regarding the consistent canonicalization of NaN
- * values in Array buffers.
- */
-var distinctNaNs = [
-  0/0, Infinity/Infinity, -(0/0), Math.pow(-1, 0.5), -Math.pow(-1, 0.5)
-];
+/*---
+description: Should not test in strict mode
+flags: [raw]
+expected:
+  pass: true
+---*/
+var seemsStrict;
+try {
+  x = 1;
+} catch (err) {
+  seemsStrict = err.constructor === ReferenceError;
+}
+
+if (seemsStrict) {
+  throw new Error('Script erroneously interpreted in strict mode.');
+}

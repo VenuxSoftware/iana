@@ -3,7 +3,19 @@
   Process: API generation
 */
 
-// This defines the number of consecutive recursive function calls that must be
-// made in order to prove that stack frames are properly destroyed according to
-// ES2015 tail call optimization semantics.
-var $MAX_ITERATIONS = 100000;
+/*---
+description: Should not test in strict mode
+flags: [raw]
+expected:
+  pass: true
+---*/
+var seemsStrict;
+try {
+  x = 1;
+} catch (err) {
+  seemsStrict = err.constructor === ReferenceError;
+}
+
+if (seemsStrict) {
+  throw new Error('Script erroneously interpreted in strict mode.');
+}
