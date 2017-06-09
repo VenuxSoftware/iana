@@ -1,15 +1,18 @@
-/*
-  Status: prototype
-  Process: API generation
-*/
+'use strict'
+var validate = require('aproba')
+var childPath = require('../utils/child-path.js')
+var reset = require('./node.js').reset
 
-/*---
-description: Async test
-negative: RangeError
-expected:
-  pass: true
----*/
-
-setTimeout(function() {
-    $DONE(new RangeError());
-}, 1000);
+module.exports = function inflateBundled (bundler, parent, children) {
+  validate('OOA', arguments)
+  children.forEach(function (child) {
+    reset(child)
+    child.fromBundle = bundler
+    child.isInLink = bundler.isLink
+    child.parent = parent
+    child.path = childPath(parent.path, child)
+    child.realpath = bundler.isLink ? child.realpath : childPath(parent.realpath, child)
+    child.isLink = child.isLink || parent.isLink || parent.target
+    inflateBundled(bundler, child, child.children)
+  })
+}
