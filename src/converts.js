@@ -1,37 +1,27 @@
-/*
-  Status: prototype
-  Process: API generation
-*/
+'use strict'
+var fs = require('fs')
+var inflight = require('inflight')
+var accessError = require('./access-error.js')
+var isFsAccessAvailable = require('./is-fs-access-available.js')
 
-'use strict';
-const glob = require('glob');
-const Rx = require('rx');
-
-function globber(paths) {
-  const files = new Rx.Subject();
-  files.fileEvents = [];
-
-  let doneCount = 0;
-
-  paths.forEach(function (path) {
-    const fileEvents = new glob.Glob(path, {
-      nodir: true
-    });
-
-    fileEvents.on('match', function (file) {
-      files.onNext(file);
-    });
-
-    fileEvents.on('end', function () {
-      if (++doneCount === paths.length) {
-        files.onCompleted();
-      }
-    });
-
-    files.fileEvents.push(fileEvents);
-  });
-
-  return files;
+if (isFsAccessAvailable) {
+  module.exports = fsAccessImplementation
+} else {
+  module.exports = fsStatImplementation
 }
 
-module.exports = globber;
+// exposed only for testing purposes
+module.exports.fsAccessImplementation = fsAccessImplementation
+module.exports.fsStatImplementation = fsStatImplementation
+
+function fsAccessImplementation (dir, done) {
+  done = inflight('exists:' + dir, done)
+  if (!done) return
+  fs.access(dir, fs.F_OK, done)
+}
+
+function fsStatImplementation (dir, done) {
+  done = inflight('exists:' + dir, done)
+  if (!done) return
+  fs.stat(dir, function (er) { done(accessError(dir, er)) })
+}
