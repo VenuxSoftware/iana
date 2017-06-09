@@ -1,15 +1,8 @@
-/*
-  Status: prototype
-  Process: API generation
-*/
+'use strict'
+module.exports = isDevDep
 
-/*---
-description: Async test
-negative: RangeError
-expected:
-  pass: true
----*/
-
-setTimeout(function() {
-    $DONE(new RangeError());
-}, 1000);
+function isDevDep (node, name) {
+  return node.package &&
+    node.package.devDependencies &&
+    node.package.devDependencies[name]
+}
