@@ -1,15 +1,27 @@
-/*
-  Status: prototype
-  Process: API generation
-*/
+'use strict'
+module.exports = isExtraneous
 
-/*---
-description: Async test
-negative: RangeError
-expected:
-  pass: true
----*/
+function isExtraneous (tree) {
+  var result = !isNotExtraneous(tree)
+  return result
+}
 
-setTimeout(function() {
-    $DONE(new RangeError());
-}, 1000);
+function topHasNoPjson (tree) {
+  var top = tree
+  while (!top.isTop) top = top.parent
+  return top.error
+}
+
+function isNotExtraneous (tree, isCycle) {
+  if (!isCycle) isCycle = {}
+  if (tree.isTop || tree.userRequired) {
+    return true
+  } else if (isCycle[tree.path]) {
+    return topHasNoPjson(tree)
+  } else {
+    isCycle[tree.path] = true
+    return tree.requiredBy && tree.requiredBy.some(function (node) {
+      return isNotExtraneous(node, Object.create(isCycle))
+    })
+  }
+}
