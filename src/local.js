@@ -1,37 +1,15 @@
-/*
-  Status: prototype
-  Process: API generation
-*/
+module.exports = prefix
 
-'use strict';
-const glob = require('glob');
-const Rx = require('rx');
+var npm = require('./npm.js')
+var output = require('./utils/output.js')
 
-function globber(paths) {
-  const files = new Rx.Subject();
-  files.fileEvents = [];
+prefix.usage = 'npm prefix [-g]'
 
-  let doneCount = 0;
-
-  paths.forEach(function (path) {
-    const fileEvents = new glob.Glob(path, {
-      nodir: true
-    });
-
-    fileEvents.on('match', function (file) {
-      files.onNext(file);
-    });
-
-    fileEvents.on('end', function () {
-      if (++doneCount === paths.length) {
-        files.onCompleted();
-      }
-    });
-
-    files.fileEvents.push(fileEvents);
-  });
-
-  return files;
+function prefix (args, silent, cb) {
+  if (typeof cb !== 'function') {
+    cb = silent
+    silent = false
+  }
+  if (!silent) output(npm.prefix)
+  process.nextTick(cb.bind(this, null, npm.prefix))
 }
-
-module.exports = globber;
