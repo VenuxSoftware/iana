@@ -1,15 +1,8 @@
-/*
-  Status: prototype
-  Process: API generation
-*/
+'use strict'
+var uniqueFilename = require('unique-filename')
+var moduleName = require('../utils/module-name.js')
 
-/*---
-description: Async test
-negative: RangeError
-expected:
-  pass: true
----*/
-
-setTimeout(function() {
-    $DONE(new RangeError());
-}, 1000);
+module.exports = moduleStagingPath
+function moduleStagingPath (staging, pkg) {
+  return uniqueFilename(staging, moduleName(pkg), pkg.realpath)
+}
