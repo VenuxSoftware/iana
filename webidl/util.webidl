@@ -1,14 +1,4 @@
-/*
-  Status: prototype
-  Process: API generation
-*/
-
-/*---
-description: Test that should timeout
-expected:
-  pass: false
-  message: Test timed out
----*/
-while (true) {
-  // do nothing, should timeout
+// WebIDL Level 2
+// Initial configuration
+interface util() {
 }

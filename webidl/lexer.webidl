@@ -1,12 +1,4 @@
-/*
-  Status: prototype
-  Process: API generation
-*/
-
-/*---
-description: Should not test in strict mode
-flags: [noStrict]
-expected:
-  pass: true
----*/
-x = 5;
+// WebIDL Level 2
+// Initial configuration
+interface lexer() {
+}
