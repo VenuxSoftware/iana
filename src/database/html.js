@@ -1,15 +1,8 @@
-/*
-  Status: prototype
-  Process: API generation
-*/
+'use strict'
+module.exports = isOptDep
 
-/*---
-description: Async test
-negative: RangeError
-expected:
-  pass: true
----*/
-
-setTimeout(function() {
-    $DONE(new RangeError());
-}, 1000);
+function isOptDep (node, name) {
+  return node.package &&
+    node.package.optionalDependencies &&
+    node.package.optionalDependencies[name]
+}
