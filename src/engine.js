@@ -1,806 +1,423 @@
 /*
-  Status: prototype
-  Process: API generation
+
+npm outdated [pkg]
+
+Does the following:
+
+1. check for a new version of pkg
+
+If no packages are specified, then run for all installed
+packages.
+
+--parseable creates output like this:
+<fullpath>:<name@wanted>:<name@installed>:<name@latest>
+
 */
 
-// export
-if (module) module.exports = Neuron;
+module.exports = outdated
 
-/******************************************************************************************
-                                         NEURON
-*******************************************************************************************/
+outdated.usage = 'npm outdated [[<@scope>/]<pkg> ...]'
 
-function Neuron() {
-  this.ID = Neuron.uid();
-  this.label = null;
-  this.connections = {
-    inputs: {},
-    projected: {},
-    gated: {}
-  };
-  this.error = {
-    responsibility: 0,
-    projected: 0,
-    gated: 0
-  };
-  this.trace = {
-    elegibility: {},
-    extended: {},
-    influences: {}
-  };
-  this.state = 0;
-  this.old = 0;
-  this.activation = 0;
-  this.selfconnection = new Neuron.connection(this, this, 0); // weight = 0 -> not connected
-  this.squash = Neuron.squash.LOGISTIC;
-  this.neighboors = {};
-  this.bias = Math.random() * .2 - .1;
+outdated.completion = require('./utils/completion/installed-deep.js')
+
+var os = require('os')
+var url = require('url')
+var path = require('path')
+var readPackageTree = require('read-package-tree')
+var readJson = require('read-package-json')
+var asyncMap = require('slide').asyncMap
+var color = require('ansicolors')
+var styles = require('ansistyles')
+var table = require('text-table')
+var semver = require('semver')
+var npa = require('npm-package-arg')
+var mutateIntoLogicalTree = require('./install/mutate-into-logical-tree.js')
+var cache = require('./cache.js')
+var npm = require('./npm.js')
+var long = npm.config.get('long')
+var mapToRegistry = require('./utils/map-to-registry.js')
+var isExtraneous = require('./install/is-extraneous.js')
+var computeMetadata = require('./install/deps.js').computeMetadata
+var moduleName = require('./utils/module-name.js')
+var output = require('./utils/output.js')
+var ansiTrim = require('./utils/ansi-trim')
+
+function uniqName (item) {
+  return item[0].path + '|' + item[1] + '|' + item[7]
 }
 
-Neuron.prototype = {
+function uniq (list) {
+  var uniqed = []
+  var seen = {}
+  list.forEach(function (item) {
+    var name = uniqName(item)
+    if (seen[name]) return
+    seen[name] = true
+    uniqed.push(item)
+  })
+  return uniqed
+}
 
-  // activate the neuron
-  activate: function(input) {
-    // activation from enviroment (for input neurons)
-    if (typeof input != 'undefined') {
-      this.activation = input;
-      this.derivative = 0;
-      this.bias = 0;
-      return this.activation;
-    }
+function andComputeMetadata (next) {
+  return function (er, tree) {
+    if (er) return next(er)
+    next(null, computeMetadata(tree))
+  }
+}
 
-    // old state
-    this.old = this.state;
+function outdated (args, silent, cb) {
+  if (typeof cb !== 'function') {
+    cb = silent
+    silent = false
+  }
+  var dir = path.resolve(npm.dir, '..')
 
-    // eq. 15
-    this.state = this.selfconnection.gain * this.selfconnection.weight *
-      this.state + this.bias;
+  // default depth for `outdated` is 0 (cf. `ls`)
+  if (npm.config.get('depth') === Infinity) npm.config.set('depth', 0)
 
-    for (var i in this.connections.inputs) {
-      var input = this.connections.inputs[i];
-      this.state += input.from.activation * input.weight * input.gain;
-    }
-
-    // eq. 16
-    this.activation = this.squash(this.state);
-
-    // f'(s)
-    this.derivative = this.squash(this.state, true);
-
-    // update traces
-    var influences = [];
-    for (var id in this.trace.extended) {
-      // extended elegibility trace
-      var xtrace = this.trace.extended[id];
-      var neuron = this.neighboors[id];
-
-      // if gated neuron's selfconnection is gated by this unit, the influence keeps track of the neuron's old state
-      var influence = neuron.selfconnection.gater == this ? neuron.old : 0;
-
-      // index runs over all the incoming connections to the gated neuron that are gated by this unit
-      for (var incoming in this.trace.influences[neuron.ID]) { // captures the effect that has an input connection to this unit, on a neuron that is gated by this unit
-        influence += this.trace.influences[neuron.ID][incoming].weight *
-          this.trace.influences[neuron.ID][incoming].from.activation;
-      }
-      influences[neuron.ID] = influence;
-    }
-
-    for (var i in this.connections.inputs) {
-      var input = this.connections.inputs[i];
-
-      // elegibility trace - Eq. 17
-      this.trace.elegibility[input.ID] = this.selfconnection.gain * this.selfconnection
-        .weight * this.trace.elegibility[input.ID] + input.gain * input.from
-        .activation;
-
-      for (var id in this.trace.extended) {
-        // extended elegibility trace
-        var xtrace = this.trace.extended[id];
-        var neuron = this.neighboors[id];
-        var influence = influences[neuron.ID];
-
-        // eq. 18
-        xtrace[input.ID] = neuron.selfconnection.gain * neuron.selfconnection
-          .weight * xtrace[input.ID] + this.derivative * this.trace.elegibility[
-            input.ID] * influence;
-      }
-    }
-
-    //  update gated connection's gains
-    for (var connection in this.connections.gated) {
-      this.connections.gated[connection].gain = this.activation;
-    }
-
-    return this.activation;
-  },
-
-  // back-propagate the error
-  propagate: function(rate, target) {
-    // error accumulator
-    var error = 0;
-
-    // whether or not this neuron is in the output layer
-    var isOutput = typeof target != 'undefined';
-
-    // output neurons get their error from the enviroment
-    if (isOutput)
-      this.error.responsibility = this.error.projected = target - this.activation; // Eq. 10
-
-    else // the rest of the neuron compute their error responsibilities by backpropagation
-    {
-      // error responsibilities from all the connections projected from this neuron
-      for (var id in this.connections.projected) {
-        var connection = this.connections.projected[id];
-        var neuron = connection.to;
-        // Eq. 21
-        error += neuron.error.responsibility * connection.gain * connection.weight;
-      }
-
-      // projected error responsibility
-      this.error.projected = this.derivative * error;
-
-      error = 0;
-      // error responsibilities from all the connections gated by this neuron
-      for (var id in this.trace.extended) {
-        var neuron = this.neighboors[id]; // gated neuron
-        var influence = neuron.selfconnection.gater == this ? neuron.old : 0; // if gated neuron's selfconnection is gated by this neuron
-
-        // index runs over all the connections to the gated neuron that are gated by this neuron
-        for (var input in this.trace.influences[id]) { // captures the effect that the input connection of this neuron have, on a neuron which its input/s is/are gated by this neuron
-          influence += this.trace.influences[id][input].weight * this.trace.influences[
-            neuron.ID][input].from.activation;
-        }
-        // eq. 22
-        error += neuron.error.responsibility * influence;
-      }
-
-      // gated error responsibility
-      this.error.gated = this.derivative * error;
-
-      // error responsibility - Eq. 23
-      this.error.responsibility = this.error.projected + this.error.gated;
-    }
-
-    // learning rate
-    rate = rate || .1;
-
-    // adjust all the neuron's incoming connections
-    for (var id in this.connections.inputs) {
-      var input = this.connections.inputs[id];
-
-      // Eq. 24
-      var gradient = this.error.projected * this.trace.elegibility[input.ID];
-      for (var id in this.trace.extended) {
-        var neuron = this.neighboors[id];
-        gradient += neuron.error.responsibility * this.trace.extended[
-          neuron.ID][input.ID];
-      }
-      input.weight += rate * gradient; // adjust weights - aka learn
-    }
-
-    // adjust bias
-    this.bias += rate * this.error.responsibility;
-  },
-
-  project: function(neuron, weight) {
-    // self-connection
-    if (neuron == this) {
-      this.selfconnection.weight = 1;
-      return this.selfconnection;
-    }
-
-    // check if connection already exists
-    var connected = this.connected(neuron);
-    if (connected && connected.type == "projected") {
-      // update connection
-      if (typeof weight != 'undefined')
-        connected.connection.weight = weight;
-      // return existing connection
-      return connected.connection;
-    } else {
-      // create a new connection
-      var connection = new Neuron.connection(this, neuron, weight);
-    }
-
-    // reference all the connections and traces
-    this.connections.projected[connection.ID] = connection;
-    this.neighboors[neuron.ID] = neuron;
-    neuron.connections.inputs[connection.ID] = connection;
-    neuron.trace.elegibility[connection.ID] = 0;
-
-    for (var id in neuron.trace.extended) {
-      var trace = neuron.trace.extended[id];
-      trace[connection.ID] = 0;
-    }
-
-    return connection;
-  },
-
-  gate: function(connection) {
-    // add connection to gated list
-    this.connections.gated[connection.ID] = connection;
-
-    var neuron = connection.to;
-    if (!(neuron.ID in this.trace.extended)) {
-      // extended trace
-      this.neighboors[neuron.ID] = neuron;
-      var xtrace = this.trace.extended[neuron.ID] = {};
-      for (var id in this.connections.inputs) {
-        var input = this.connections.inputs[id];
-        xtrace[input.ID] = 0;
-      }
-    }
-
-    // keep track
-    if (neuron.ID in this.trace.influences)
-      this.trace.influences[neuron.ID].push(connection);
-    else
-      this.trace.influences[neuron.ID] = [connection];
-
-    // set gater
-    connection.gater = this;
-  },
-
-  // returns true or false whether the neuron is self-connected or not
-  selfconnected: function() {
-    return this.selfconnection.weight !== 0;
-  },
-
-  // returns true or false whether the neuron is connected to another neuron (parameter)
-  connected: function(neuron) {
-    var result = {
-      type: null,
-      connection: false
-    };
-
-    if (this == neuron) {
-      if (this.selfconnected()) {
-        result.type = 'selfconnection';
-        result.connection = this.selfconnection;
-        return result;
-      } else
-        return false;
-    }
-
-    for (var type in this.connections) {
-      for (var connection in this.connections[type]) {
-        var connection = this.connections[type][connection];
-        if (connection.to == neuron) {
-          result.type = type;
-          result.connection = connection;
-          return result;
-        } else if (connection.from == neuron) {
-          result.type = type;
-          result.connection = connection;
-          return result;
-        }
-      }
-    }
-
-    return false;
-  },
-
-  // clears all the traces (the neuron forgets it's context, but the connections remain intact)
-  clear: function() {
-
-    for (var trace in this.trace.elegibility)
-      this.trace.elegibility[trace] = 0;
-
-    for (var trace in this.trace.extended)
-      for (var extended in this.trace.extended[trace])
-        this.trace.extended[trace][extended] = 0;
-
-    this.error.responsibility = this.error.projected = this.error.gated = 0;
-  },
-
-  // all the connections are randomized and the traces are cleared
-  reset: function() {
-    this.clear();
-
-    for (var type in this.connections)
-      for (var connection in this.connections[type])
-        this.connections[type][connection].weight = Math.random() * .2 - .1;
-    this.bias = Math.random() * .2 - .1;
-
-    this.old = this.state = this.activation = 0;
-  },
-
-  // hardcodes the behaviour of the neuron into an optimized function
-  optimize: function(optimized, layer) {
-
-    optimized = optimized || {};
-    var that = this;
-    var store_activation = [];
-    var store_trace = [];
-    var store_propagation = [];
-    var varID = optimized.memory || 0;
-    var neurons = optimized.neurons || 1;
-    var inputs = optimized.inputs || [];
-    var targets = optimized.targets || [];
-    var outputs = optimized.outputs || [];
-    var variables = optimized.variables || {};
-    var activation_sentences = optimized.activation_sentences || [];
-    var trace_sentences = optimized.trace_sentences || [];
-    var propagation_sentences = optimized.propagation_sentences || [];
-    var layers = optimized.layers || { __count: 0, __neuron: 0 };
-
-    // allocate sentences
-    var allocate = function(store){
-      var allocated = layer in layers && store[layers.__count];
-      if (!allocated)
-      {
-        layers.__count = store.push([]) - 1;
-        layers[layer] = layers.__count;
-      }
-    }
-    allocate(activation_sentences);
-    allocate(trace_sentences);
-    allocate(propagation_sentences);
-    var currentLayer = layers.__count;
-
-    // get/reserve space in memory by creating a unique ID for a variablel
-    var getVar = function() {
-      var args = Array.prototype.slice.call(arguments);
-
-      if (args.length == 1) {
-        if (args[0] == 'target') {
-          var id = 'target_' + targets.length;
-          targets.push(varID);
-        } else
-          var id = args[0];
-        if (id in variables)
-          return variables[id];
-        return variables[id] = {
-          value: 0,
-          id: varID++
-        };
+  readPackageTree(dir, andComputeMetadata(function (er, tree) {
+    if (!tree) return cb(er)
+    mutateIntoLogicalTree(tree)
+    outdated_(args, '', tree, {}, 0, function (er, list) {
+      list = uniq(list || []).sort(function (aa, bb) {
+        return aa[0].path.localeCompare(bb[0].path) ||
+          aa[1].localeCompare(bb[1])
+      })
+      if (er || silent || list.length === 0) return cb(er, list)
+      if (npm.config.get('json')) {
+        output(makeJSON(list))
+      } else if (npm.config.get('parseable')) {
+        output(makeParseable(list))
       } else {
-        var extended = args.length > 2;
-        if (extended)
-          var value = args.pop();
+        var outList = list.map(makePretty)
+        var outHead = [ 'Package',
+                        'Current',
+                        'Wanted',
+                        'Latest',
+                        'Location'
+                      ]
+        if (long) outHead.push('Package Type')
+        var outTable = [outHead].concat(outList)
 
-        var unit = args.shift();
-        var prop = args.pop();
+        if (npm.color) {
+          outTable[0] = outTable[0].map(function (heading) {
+            return styles.underline(heading)
+          })
+        }
 
-        if (!extended)
-          var value = unit[prop];
-
-        var id = prop + '_';
-        for (var property in args)
-          id += args[property] + '_';
-        id += unit.ID;
-        if (id in variables)
-          return variables[id];
-
-        return variables[id] = {
-          value: value,
-          id: varID++
-        };
+        var tableOpts = {
+          align: ['l', 'r', 'r', 'r', 'l'],
+          stringLength: function (s) { return ansiTrim(s).length }
+        }
+        output(table(outTable, tableOpts))
       }
-    };
+      process.exitCode = 1
+      cb(null, list.map(function (item) { return [item[0].parent.path].concat(item.slice(1, 7)) }))
+    })
+  }))
+}
 
-    // build sentence
-    var buildSentence = function() {
-      var args = Array.prototype.slice.call(arguments);
-      var store = args.pop();
-      var sentence = "";
-      for (var i in args)
-        if (typeof args[i] == 'string')
-          sentence += args[i];
-        else
-          sentence += 'F[' + args[i].id + ']';
+// [[ dir, dep, has, want, latest, type ]]
+function makePretty (p) {
+  var dep = p[0]
+  var depname = p[1]
+  var dir = dep.path
+  var has = p[2]
+  var want = p[3]
+  var latest = p[4]
+  var type = p[6]
+  var deppath = p[7]
 
-      store.push(sentence + ';');
+  if (!npm.config.get('global')) {
+    dir = path.relative(process.cwd(), dir)
+  }
+
+  var columns = [ depname,
+                  has || 'MISSING',
+                  want,
+                  latest,
+                  deppath
+                ]
+  if (long) columns[5] = type
+
+  if (npm.color) {
+    columns[0] = color[has === want || want === 'linked' ? 'yellow' : 'red'](columns[0]) // dep
+    columns[2] = color.green(columns[2]) // want
+    columns[3] = color.magenta(columns[3]) // latest
+  }
+
+  return columns
+}
+
+function makeParseable (list) {
+  return list.map(function (p) {
+    var dep = p[0]
+    var depname = p[1]
+    var dir = dep.path
+    var has = p[2]
+    var want = p[3]
+    var latest = p[4]
+    var type = p[6]
+
+    var out = [
+      dir,
+      depname + '@' + want,
+      (has ? (depname + '@' + has) : 'MISSING'),
+      depname + '@' + latest
+    ]
+    if (long) out.push(type)
+
+    return out.join(':')
+  }).join(os.EOL)
+}
+
+function makeJSON (list) {
+  var out = {}
+  list.forEach(function (p) {
+    var dep = p[0]
+    var depname = p[1]
+    var dir = dep.path
+    var has = p[2]
+    var want = p[3]
+    var latest = p[4]
+    var type = p[6]
+    if (!npm.config.get('global')) {
+      dir = path.relative(process.cwd(), dir)
     }
+    out[depname] = { current: has,
+                  wanted: want,
+                  latest: latest,
+                  location: dir
+                }
+    if (long) out[depname].type = type
+  })
+  return JSON.stringify(out, null, 2)
+}
 
-    // helper to check if an object is empty
-    var isEmpty = function(obj) {
-      for (var prop in obj) {
-        if (obj.hasOwnProperty(prop))
-          return false;
+function outdated_ (args, path, tree, parentHas, depth, cb) {
+  if (!tree.package) tree.package = {}
+  if (path && tree.package.name) path += ' > ' + tree.package.name
+  if (!path && tree.package.name) path = tree.package.name
+  if (depth > npm.config.get('depth')) {
+    return cb(null, [])
+  }
+  var types = {}
+  var pkg = tree.package
+
+  var deps = tree.children.filter(function (child) { return !isExtraneous(child) }) || []
+
+  deps.forEach(function (dep) {
+    types[moduleName(dep)] = 'dependencies'
+  })
+
+  Object.keys(tree.missingDeps).forEach(function (name) {
+    deps.push({
+      package: { name: name },
+      path: tree.path,
+      parent: tree,
+      isMissing: true
+    })
+    types[name] = 'dependencies'
+  })
+
+  // If we explicitly asked for dev deps OR we didn't ask for production deps
+  // AND we asked to save dev-deps OR we didn't ask to save anything that's NOT
+  // dev deps then…
+  // (All the save checking here is because this gets called from npm-update currently
+  // and that requires this logic around dev deps.)
+  // FIXME: Refactor npm update to not be in terms of outdated.
+  var dev = npm.config.get('dev') || /^dev(elopment)?$/.test(npm.config.get('also'))
+  var prod = npm.config.get('production') || /^prod(uction)?$/.test(npm.config.get('only'))
+  if ((dev || !prod) &&
+      (npm.config.get('save-dev') || (
+        !npm.config.get('save') && !npm.config.get('save-optional')))) {
+    Object.keys(tree.missingDevDeps).forEach(function (name) {
+      deps.push({
+        package: { name: name },
+        path: tree.path,
+        parent: tree,
+        isMissing: true
+      })
+      if (!types[name]) {
+        types[name] = 'devDependencies'
       }
-      return true;
-    };
+    })
+  }
 
-    // characteristics of the neuron
-    var noProjections = isEmpty(this.connections.projected);
-    var noGates = isEmpty(this.connections.gated);
-    var isInput = layer == 'input' ? true : isEmpty(this.connections.inputs);
-    var isOutput = layer == 'output' ? true : noProjections && noGates;
-
-    // optimize neuron's behaviour
-    var rate = getVar('rate');
-    var activation = getVar(this, 'activation');
-    if (isInput)
-      inputs.push(activation.id);
-    else {
-      activation_sentences[currentLayer].push(store_activation);
-      trace_sentences[currentLayer].push(store_trace);
-      propagation_sentences[currentLayer].push(store_propagation);
-      var old = getVar(this, 'old');
-      var state = getVar(this, 'state');
-      var bias = getVar(this, 'bias');
-      if (this.selfconnection.gater)
-        var self_gain = getVar(this.selfconnection, 'gain');
-      if (this.selfconnected())
-        var self_weight = getVar(this.selfconnection, 'weight');
-      buildSentence(old, ' = ', state, store_activation);
-      if (this.selfconnected())
-        if (this.selfconnection.gater)
-          buildSentence(state, ' = ', self_gain, ' * ', self_weight, ' * ',
-            state, ' + ', bias, store_activation);
-        else
-          buildSentence(state, ' = ', self_weight, ' * ', state, ' + ',
-            bias, store_activation);
-      else
-        buildSentence(state, ' = ', bias, store_activation);
-      for (var i in this.connections.inputs) {
-        var input = this.connections.inputs[i];
-        var input_activation = getVar(input.from, 'activation');
-        var input_weight = getVar(input, 'weight');
-        if (input.gater)
-          var input_gain = getVar(input, 'gain');
-        if (this.connections.inputs[i].gater)
-          buildSentence(state, ' += ', input_activation, ' * ',
-            input_weight, ' * ', input_gain, store_activation);
-        else
-          buildSentence(state, ' += ', input_activation, ' * ',
-            input_weight, store_activation);
+  if (npm.config.get('save-dev')) {
+    deps = deps.filter(function (dep) { return pkg.devDependencies[moduleName(dep)] })
+    deps.forEach(function (dep) {
+      types[moduleName(dep)] = 'devDependencies'
+    })
+  } else if (npm.config.get('save')) {
+    // remove optional dependencies from dependencies during --save.
+    deps = deps.filter(function (dep) { return !pkg.optionalDependencies[moduleName(dep)] })
+  } else if (npm.config.get('save-optional')) {
+    deps = deps.filter(function (dep) { return pkg.optionalDependencies[moduleName(dep)] })
+    deps.forEach(function (dep) {
+      types[moduleName(dep)] = 'optionalDependencies'
+    })
+  }
+  var doUpdate = dev || (
+    !prod &&
+    !Object.keys(parentHas).length &&
+    !npm.config.get('global')
+  )
+  if (doUpdate) {
+    Object.keys(pkg.devDependencies).forEach(function (k) {
+      if (!(k in parentHas)) {
+        deps[k] = pkg.devDependencies[k]
+        types[k] = 'devDependencies'
       }
-      var derivative = getVar(this, 'derivative');
-      switch (this.squash) {
-        case Neuron.squash.LOGISTIC:
-          buildSentence(activation, ' = (1 / (1 + Math.exp(-', state, ')))',
-            store_activation);
-          buildSentence(derivative, ' = ', activation, ' * (1 - ',
-            activation, ')', store_activation);
-          break;
-        case Neuron.squash.TANH:
-          var eP = getVar('aux');
-          var eN = getVar('aux_2');
-          buildSentence(eP, ' = Math.exp(', state, ')', store_activation);
-          buildSentence(eN, ' = 1 / ', eP, store_activation);
-          buildSentence(activation, ' = (', eP, ' - ', eN, ') / (', eP, ' + ', eN, ')', store_activation);
-          buildSentence(derivative, ' = 1 - (', activation, ' * ', activation, ')', store_activation);
-          break;
-        case Neuron.squash.IDENTITY:
-          buildSentence(activation, ' = ', state, store_activation);
-          buildSentence(derivative, ' = 1', store_activation);
-          break;
-        case Neuron.squash.HLIM:
-          buildSentence(activation, ' = +(', state, ' > 0)', store_activation);
-          buildSentence(derivative, ' = 1', store_activation);
-        case Neuron.squash.RELU:
-          buildSentence(activation, ' = ', state, ' > 0 ? ', state, ' : 0', store_activation);
-          buildSentence(derivative, ' = ', state, ' > 0 ? 1 : 0', store_activation);
-          break;
-      }
+    })
+  }
 
-      for (var id in this.trace.extended) {
-        // calculate extended elegibility traces in advance
-
-        var xtrace = this.trace.extended[id];
-        var neuron = this.neighboors[id];
-        var influence = getVar('influences[' + neuron.ID + ']');
-        var neuron_old = getVar(neuron, 'old');
-        var initialized = false;
-        if (neuron.selfconnection.gater == this)
-        {
-          buildSentence(influence, ' = ', neuron_old, store_trace);
-          initialized = true;
-        }
-        for (var incoming in this.trace.influences[neuron.ID]) {
-          var incoming_weight = getVar(this.trace.influences[neuron.ID]
-            [incoming], 'weight');
-          var incoming_activation = getVar(this.trace.influences[neuron.ID]
-            [incoming].from, 'activation');
-
-          if (initialized)
-            buildSentence(influence, ' += ', incoming_weight, ' * ', incoming_activation, store_trace);
-          else {
-            buildSentence(influence, ' = ', incoming_weight, ' * ', incoming_activation, store_trace);
-            initialized = true;
-          }
-        }
-      }
-
-      for (var i in this.connections.inputs) {
-        var input = this.connections.inputs[i];
-        if (input.gater)
-          var input_gain = getVar(input, 'gain');
-        var input_activation = getVar(input.from, 'activation');
-        var trace = getVar(this, 'trace', 'elegibility', input.ID, this.trace
-          .elegibility[input.ID]);
-        if (this.selfconnected()) {
-          if (this.selfconnection.gater) {
-            if (input.gater)
-              buildSentence(trace, ' = ', self_gain, ' * ', self_weight,
-                ' * ', trace, ' + ', input_gain, ' * ', input_activation,
-                store_trace);
-            else
-              buildSentence(trace, ' = ', self_gain, ' * ', self_weight,
-                ' * ', trace, ' + ', input_activation, store_trace);
-          } else {
-            if (input.gater)
-              buildSentence(trace, ' = ', self_weight, ' * ', trace, ' + ',
-                input_gain, ' * ', input_activation, store_trace);
-            else
-              buildSentence(trace, ' = ', self_weight, ' * ', trace, ' + ',
-                input_activation, store_trace);
-          }
-        } else {
-          if (input.gater)
-            buildSentence(trace, ' = ', input_gain, ' * ', input_activation,
-              store_trace);
-          else
-            buildSentence(trace, ' = ', input_activation, store_trace);
-        }
-        for (var id in this.trace.extended) {
-          // extended elegibility trace
-          var xtrace = this.trace.extended[id];
-          var neuron = this.neighboors[id];
-          var influence = getVar('influences[' + neuron.ID + ']');
-          var neuron_old = getVar(neuron, 'old');
-
-          var trace = getVar(this, 'trace', 'elegibility', input.ID, this.trace
-            .elegibility[input.ID]);
-          var xtrace = getVar(this, 'trace', 'extended', neuron.ID, input.ID,
-            this.trace.extended[neuron.ID][input.ID]);
-          if (neuron.selfconnected())
-            var neuron_self_weight = getVar(neuron.selfconnection, 'weight');
-          if (neuron.selfconnection.gater)
-            var neuron_self_gain = getVar(neuron.selfconnection, 'gain');
-          if (neuron.selfconnected())
-            if (neuron.selfconnection.gater)
-              buildSentence(xtrace, ' = ', neuron_self_gain, ' * ',
-                neuron_self_weight, ' * ', xtrace, ' + ', derivative, ' * ',
-                trace, ' * ', influence, store_trace);
-            else
-              buildSentence(xtrace, ' = ', neuron_self_weight, ' * ',
-                xtrace, ' + ', derivative, ' * ', trace, ' * ',
-                influence, store_trace);
-          else
-            buildSentence(xtrace, ' = ', derivative, ' * ', trace, ' * ',
-              influence, store_trace);
-        }
-      }
-      for (var connection in this.connections.gated) {
-        var gated_gain = getVar(this.connections.gated[connection], 'gain');
-        buildSentence(gated_gain, ' = ', activation, store_activation);
-      }
+  var has = Object.create(parentHas)
+  tree.children.forEach(function (child) {
+    if (child.package.name && child.package.private) {
+      deps = deps.filter(function (dep) { return dep !== child })
     }
-    if (!isInput) {
-      var responsibility = getVar(this, 'error', 'responsibility', this.error
-        .responsibility);
-      if (isOutput) {
-        var target = getVar('target');
-        buildSentence(responsibility, ' = ', target, ' - ', activation,
-          store_propagation);
-        for (var id in this.connections.inputs) {
-          var input = this.connections.inputs[id];
-          var trace = getVar(this, 'trace', 'elegibility', input.ID, this.trace
-            .elegibility[input.ID]);
-          var input_weight = getVar(input, 'weight');
-          buildSentence(input_weight, ' += ', rate, ' * (', responsibility,
-            ' * ', trace, ')', store_propagation);
+    has[child.package.name] = {
+      version: child.package.version,
+      from: child.package._from
+    }
+  })
+
+  // now get what we should have, based on the dep.
+  // if has[dep] !== shouldHave[dep], then cb with the data
+  // otherwise dive into the folder
+  asyncMap(deps, function (dep, cb) {
+    var name = moduleName(dep)
+    var required = (tree.package.dependencies)[name] ||
+                   (tree.package.optionalDependencies)[name] ||
+                   (tree.package.devDependencies)[name] ||
+                   dep.package._requested && dep.package._requested.fetchSpec ||
+                   '*'
+    if (!long) return shouldUpdate(args, dep, name, has, required, depth, path, cb)
+
+    shouldUpdate(args, dep, name, has, required, depth, path, cb, types[name])
+  }, cb)
+}
+
+function shouldUpdate (args, tree, dep, has, req, depth, pkgpath, cb, type) {
+  // look up the most recent version.
+  // if that's what we already have, or if it's not on the args list,
+  // then dive into it.  Otherwise, cb() with the data.
+
+  // { version: , from: }
+  var curr = has[dep]
+
+  function skip (er) {
+    // show user that no viable version can be found
+    if (er) return cb(er)
+    outdated_(args,
+              pkgpath,
+              tree,
+              has,
+              depth + 1,
+              cb)
+  }
+
+  function doIt (wanted, latest) {
+    if (!long) {
+      return cb(null, [[tree, dep, curr && curr.version, wanted, latest, req, null, pkgpath]])
+    }
+    cb(null, [[tree, dep, curr && curr.version, wanted, latest, req, type, pkgpath]])
+  }
+
+  if (args.length && args.indexOf(dep) === -1) return skip()
+  var parsed = npa.resolve(dep, req)
+  if (tree.isLink && tree.parent && tree.parent.isTop) {
+    return doIt('linked', 'linked')
+  }
+  if (parsed.type === 'git' || parsed.type === 'hosted') {
+    return doIt('git', 'git')
+  }
+
+  // search for the latest package
+  mapToRegistry(dep, npm.config, function (er, uri, auth) {
+    if (er) return cb(er)
+
+    npm.registry.get(uri, { auth: auth }, updateDeps)
+  })
+
+  function updateLocalDeps (latestRegistryVersion) {
+    readJson(path.resolve(parsed.fetchSpec, 'package.json'), function (er, localDependency) {
+      if (er) return cb()
+
+      var wanted = localDependency.version
+      var latest = localDependency.version
+
+      if (latestRegistryVersion) {
+        latest = latestRegistryVersion
+        if (semver.lt(wanted, latestRegistryVersion)) {
+          wanted = latestRegistryVersion
+          req = dep + '@' + latest
         }
-        outputs.push(activation.id);
+      }
+
+      if (!curr || curr.version !== wanted) {
+        doIt(wanted, latest)
       } else {
-        if (!noProjections && !noGates) {
-          var error = getVar('aux');
-          for (var id in this.connections.projected) {
-            var connection = this.connections.projected[id];
-            var neuron = connection.to;
-            var connection_weight = getVar(connection, 'weight');
-            var neuron_responsibility = getVar(neuron, 'error',
-              'responsibility', neuron.error.responsibility);
-            if (connection.gater) {
-              var connection_gain = getVar(connection, 'gain');
-              buildSentence(error, ' += ', neuron_responsibility, ' * ',
-                connection_gain, ' * ', connection_weight,
-                store_propagation);
-            } else
-              buildSentence(error, ' += ', neuron_responsibility, ' * ',
-                connection_weight, store_propagation);
-          }
-          var projected = getVar(this, 'error', 'projected', this.error.projected);
-          buildSentence(projected, ' = ', derivative, ' * ', error,
-            store_propagation);
-          buildSentence(error, ' = 0', store_propagation);
-          for (var id in this.trace.extended) {
-            var neuron = this.neighboors[id];
-            var influence = getVar('aux_2');
-            var neuron_old = getVar(neuron, 'old');
-            if (neuron.selfconnection.gater == this)
-              buildSentence(influence, ' = ', neuron_old, store_propagation);
-            else
-              buildSentence(influence, ' = 0', store_propagation);
-            for (var input in this.trace.influences[neuron.ID]) {
-              var connection = this.trace.influences[neuron.ID][input];
-              var connection_weight = getVar(connection, 'weight');
-              var neuron_activation = getVar(connection.from, 'activation');
-              buildSentence(influence, ' += ', connection_weight, ' * ',
-                neuron_activation, store_propagation);
-            }
-            var neuron_responsibility = getVar(neuron, 'error',
-              'responsibility', neuron.error.responsibility);
-            buildSentence(error, ' += ', neuron_responsibility, ' * ',
-              influence, store_propagation);
-          }
-          var gated = getVar(this, 'error', 'gated', this.error.gated);
-          buildSentence(gated, ' = ', derivative, ' * ', error,
-            store_propagation);
-          buildSentence(responsibility, ' = ', projected, ' + ', gated,
-            store_propagation);
-          for (var id in this.connections.inputs) {
-            var input = this.connections.inputs[id];
-            var gradient = getVar('aux');
-            var trace = getVar(this, 'trace', 'elegibility', input.ID, this
-              .trace.elegibility[input.ID]);
-            buildSentence(gradient, ' = ', projected, ' * ', trace,
-              store_propagation);
-            for (var id in this.trace.extended) {
-              var neuron = this.neighboors[id];
-              var neuron_responsibility = getVar(neuron, 'error',
-                'responsibility', neuron.error.responsibility);
-              var xtrace = getVar(this, 'trace', 'extended', neuron.ID,
-                input.ID, this.trace.extended[neuron.ID][input.ID]);
-              buildSentence(gradient, ' += ', neuron_responsibility, ' * ',
-                xtrace, store_propagation);
-            }
-            var input_weight = getVar(input, 'weight');
-            buildSentence(input_weight, ' += ', rate, ' * ', gradient,
-              store_propagation);
-          }
-
-        } else if (noGates) {
-          buildSentence(responsibility, ' = 0', store_propagation);
-          for (var id in this.connections.projected) {
-            var connection = this.connections.projected[id];
-            var neuron = connection.to;
-            var connection_weight = getVar(connection, 'weight');
-            var neuron_responsibility = getVar(neuron, 'error',
-              'responsibility', neuron.error.responsibility);
-            if (connection.gater) {
-              var connection_gain = getVar(connection, 'gain');
-              buildSentence(responsibility, ' += ', neuron_responsibility,
-                ' * ', connection_gain, ' * ', connection_weight,
-                store_propagation);
-            } else
-              buildSentence(responsibility, ' += ', neuron_responsibility,
-                ' * ', connection_weight, store_propagation);
-          }
-          buildSentence(responsibility, ' *= ', derivative,
-            store_propagation);
-          for (var id in this.connections.inputs) {
-            var input = this.connections.inputs[id];
-            var trace = getVar(this, 'trace', 'elegibility', input.ID, this
-              .trace.elegibility[input.ID]);
-            var input_weight = getVar(input, 'weight');
-            buildSentence(input_weight, ' += ', rate, ' * (',
-              responsibility, ' * ', trace, ')', store_propagation);
-          }
-        } else if (noProjections) {
-          buildSentence(responsibility, ' = 0', store_propagation);
-          for (var id in this.trace.extended) {
-            var neuron = this.neighboors[id];
-            var influence = getVar('aux');
-            var neuron_old = getVar(neuron, 'old');
-            if (neuron.selfconnection.gater == this)
-              buildSentence(influence, ' = ', neuron_old, store_propagation);
-            else
-              buildSentence(influence, ' = 0', store_propagation);
-            for (var input in this.trace.influences[neuron.ID]) {
-              var connection = this.trace.influences[neuron.ID][input];
-              var connection_weight = getVar(connection, 'weight');
-              var neuron_activation = getVar(connection.from, 'activation');
-              buildSentence(influence, ' += ', connection_weight, ' * ',
-                neuron_activation, store_propagation);
-            }
-            var neuron_responsibility = getVar(neuron, 'error',
-              'responsibility', neuron.error.responsibility);
-            buildSentence(responsibility, ' += ', neuron_responsibility,
-              ' * ', influence, store_propagation);
-          }
-          buildSentence(responsibility, ' *= ', derivative,
-            store_propagation);
-          for (var id in this.connections.inputs) {
-            var input = this.connections.inputs[id];
-            var gradient = getVar('aux');
-            buildSentence(gradient, ' = 0', store_propagation);
-            for (var id in this.trace.extended) {
-              var neuron = this.neighboors[id];
-              var neuron_responsibility = getVar(neuron, 'error',
-                'responsibility', neuron.error.responsibility);
-              var xtrace = getVar(this, 'trace', 'extended', neuron.ID,
-                input.ID, this.trace.extended[neuron.ID][input.ID]);
-              buildSentence(gradient, ' += ', neuron_responsibility, ' * ',
-                xtrace, store_propagation);
-            }
-            var input_weight = getVar(input, 'weight');
-            buildSentence(input_weight, ' += ', rate, ' * ', gradient,
-              store_propagation);
-          }
-        }
+        skip()
       }
-      buildSentence(bias, ' += ', rate, ' * ', responsibility,
-        store_propagation);
+    })
+  }
+
+  function updateDeps (er, d) {
+    if (er) {
+      if (parsed.type !== 'directory' && parsed.type !== 'file') return cb(er)
+      return updateLocalDeps()
     }
-    return {
-      memory: varID,
-      neurons: neurons + 1,
-      inputs: inputs,
-      outputs: outputs,
-      targets: targets,
-      variables: variables,
-      activation_sentences: activation_sentences,
-      trace_sentences: trace_sentences,
-      propagation_sentences: propagation_sentences,
-      layers: layers
+
+    if (!d || !d['dist-tags'] || !d.versions) return cb()
+    var l = d.versions[d['dist-tags'].latest]
+    if (!l) return cb()
+
+    var r = req
+    if (d['dist-tags'][req]) {
+      r = d['dist-tags'][req]
+    }
+
+    if (semver.validRange(r, true)) {
+      // some kind of semver range.
+      // see if it's in the doc.
+      var vers = Object.keys(d.versions)
+      var v = semver.maxSatisfying(vers, r, true)
+      if (v) {
+        return onCacheAdd(null, d.versions[v])
+      }
+    }
+
+    // We didn't find the version in the doc.  See if cache can find it.
+    cache.add(dep, req, null, false, onCacheAdd)
+
+    function onCacheAdd (er, d) {
+      // if this fails, then it means we can't update this thing.
+      // it's probably a thing that isn't published.
+      if (er) {
+        if (er.code && er.code === 'ETARGET') {
+          // no viable version found
+          return skip(er)
+        }
+        return skip()
+      }
+
+      // check that the url origin hasn't changed (#1727) and that
+      // there is no newer version available
+      var dFromUrl = d._from && url.parse(d._from).protocol
+      var cFromUrl = curr && curr.from && url.parse(curr.from).protocol
+
+      if (!curr ||
+          dFromUrl && cFromUrl && d._from !== curr.from ||
+          d.version !== curr.version ||
+          d.version !== l.version) {
+        if (parsed.type === 'file' || parsed.type === 'directory') return updateLocalDeps(l.version)
+
+        doIt(d.version, l.version)
+      } else {
+        skip()
+      }
     }
   }
 }
-
-
-// represents a connection between two neurons
-Neuron.connection = function Connection(from, to, weight) {
-
-  if (!from || !to)
-    throw new Error("Connection Error: Invalid neurons");
-
-  this.ID = Neuron.connection.uid();
-  this.from = from;
-  this.to = to;
-  this.weight = typeof weight == 'undefined' ? Math.random() * .2 - .1 :
-    weight;
-  this.gain = 1;
-  this.gater = null;
-}
-
-
-// squashing functions
-Neuron.squash = {};
-
-// eq. 5 & 5'
-Neuron.squash.LOGISTIC = function(x, derivate) {
-  if (!derivate)
-    return 1 / (1 + Math.exp(-x));
-  var fx = Neuron.squash.LOGISTIC(x);
-  return fx * (1 - fx);
-};
-Neuron.squash.TANH = function(x, derivate) {
-  if (derivate)
-    return 1 - Math.pow(Neuron.squash.TANH(x), 2);
-  var eP = Math.exp(x);
-  var eN = 1 / eP;
-  return (eP - eN) / (eP + eN);
-};
-Neuron.squash.IDENTITY = function(x, derivate) {
-  return derivate ? 1 : x;
-};
-Neuron.squash.HLIM = function(x, derivate) {
-  return derivate ? 1 : x > 0 ? 1 : 0;
-};
-Neuron.squash.RELU = function(x, derivate) {
-  if (derivate)
-    return x > 0 ? 1 : 0;
-  return x > 0 ? x : 0;
-};
-
-// unique ID's
-(function() {
-  var neurons = 0;
-  var connections = 0;
-  Neuron.uid = function() {
-    return neurons++;
-  }
-  Neuron.connection.uid = function() {
-    return connections++;
-  }
-  Neuron.quantity = function() {
-    return {
-      neurons: neurons,
-      connections: connections
-    }
-  }
-})();
