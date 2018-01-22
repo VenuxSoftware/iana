@@ -1,78 +1,107 @@
+'use strict'
+var test = require('tap').test
+var fs = require('graceful-fs')
+var common = require('../common-tap.js')
+var path = require('path')
+var rimraf = require('rimraf')
+var mkdirp = require('mkdirp')
+var osenv = require('osenv')
+var npmpath = path.resolve(__dirname, '../..')
+var basepath = path.resolve(osenv.tmpdir(), path.basename(__filename, '.js'))
+var globalpath = path.resolve(basepath, 'global')
+var extend = Object.assign || require('util')._extend
+var isWin32 = process.platform === 'win32'
 
-module.exports = rebuild
+test('setup', function (t) {
+  setup()
+  t.done()
+})
 
-var readInstalled = require('read-installed')
-var semver = require('semver')
-var log = require('npmlog')
-var npm = require('./npm.js')
-var npa = require('npm-package-arg')
-var usage = require('./utils/usage')
-var output = require('./utils/output.js')
+var tarball
 
-rebuild.usage = usage(
-  'rebuild',
-  'npm rebuild [[<@scope>/<name>]...]'
-)
-
-rebuild.completion = require('./utils/completion/installed-deep.js')
-
-function rebuild (args, cb) {
-  var opt = { depth: npm.config.get('depth'), dev: true }
-  readInstalled(npm.prefix, opt, function (er, data) {
-    log.info('readInstalled', typeof data)
-    if (er) return cb(er)
-    var set = filter(data, args)
-    var folders = Object.keys(set).filter(function (f) {
-      return f !== npm.prefix
-    })
-    if (!folders.length) return cb()
-    log.silly('rebuild set', folders)
-    cleanBuild(folders, set, cb)
+test('build-tarball', function (t) {
+  common.npm(['pack'], {cwd: npmpath, stdio: ['ignore', 'pipe', process.stderr]}, function (err, code, stdout) {
+    if (err) throw err
+    t.is(code, 0, 'pack went ok')
+    tarball = path.resolve(npmpath, stdout.trim().replace(/^(?:.|\n)*(?:^|\n)(.*?[.]tgz)$/, '$1'))
+    t.match(tarball, /[.]tgz$/, 'got a tarball')
+    t.done()
   })
+})
+
+function exists () {
+  try {
+    fs.statSync(path.resolve.apply(null, arguments))
+    return true
+  } catch (ex) {
+    return false
+  }
 }
 
-function cleanBuild (folders, set, cb) {
-  npm.commands.build(folders, function (er) {
-    if (er) return cb(er)
-    output(folders.map(function (f) {
-      return set[f] + ' ' + f
-    }).join('\n'))
-    cb()
-  })
+test('npm-self-install', function (t) {
+  if (!tarball) return t.done()
+
+  var env = extend({}, process.env)
+  var pathsep = isWin32 ? ';' : ':'
+  env.npm_config_prefix = globalpath
+  env.npm_config_global = 'true'
+  env.NODE_PATH = null
+  env.npm_config_user_agent = null
+  env.npm_config_color = 'always'
+  env.npm_config_progress = 'always'
+  env.npm_config_shrinkwrap = 'false'
+  var PATH = env.PATH ? env.PATH.split(pathsep) : []
+  var binpath = isWin32 ? globalpath : path.join(globalpath, 'bin')
+  var cmdname = isWin32 ? 'npm.cmd' : 'npm'
+  PATH.unshift(binpath)
+  env.PATH = PATH.join(pathsep)
+
+  var opts = {cwd: basepath, env: env, stdio: ['ignore', 'ignore', process.stderr]}
+
+  common.npm(['install', '--ignore-scripts', tarball], opts, installCheckAndTest)
+  function installCheckAndTest (err, code) {
+    if (err) throw err
+    t.is(code, 0, 'install went ok')
+    t.is(exists(binpath, cmdname), true, 'binary was installed')
+    t.is(exists(globalpath, isWin32 ? '' : 'lib', 'node_modules', 'npm'), true, 'module path exists')
+    common.npm(['ls', '--json', '--depth=0'], {cwd: basepath, env: env}, lsCheckAndRemove)
+  }
+  function lsCheckAndRemove (err, code, stdout, stderr) {
+    t.ifError(err, 'npm test on array bin')
+    t.equal(code, 0, 'exited OK')
+    t.equal(stderr.trim(), '', 'no error output')
+    var installed = JSON.parse(stdout.trim())
+    t.is(Object.keys(installed.dependencies).length, 1, 'one thing installed')
+    t.is(path.resolve(globalpath, installed.dependencies.npm.from), tarball, 'and it was our npm tarball')
+    common.npm(['rm', 'npm'], {cwd: basepath, env: env}, removeCheck)
+  }
+  function removeCheck (err, code) {
+    if (err) throw err
+    t.is(code, 0, 'remove went ok')
+    common.npm(['ls', '--json', '--depth=0'], {cwd: basepath, env: env}, andDone)
+  }
+  function andDone (err, code, stdout, stderr) {
+    if (err) throw err
+    t.is(code, 0, 'remove went ok')
+    t.equal(stderr.trim(), '', 'no error output')
+    var installed = JSON.parse(stdout.trim())
+    t.ok(!installed.dependencies || installed.dependencies.length === 0, 'nothing left')
+    t.is(exists(binpath, cmdname), false, 'binary was removed')
+    t.is(exists(globalpath, 'lib', 'node_modules', 'npm'), false, 'module was entirely removed')
+    t.done()
+  }
+})
+
+test('cleanup', function (t) {
+  cleanup()
+  t.done()
+})
+
+function setup () {
+  cleanup()
+  mkdirp.sync(globalpath)
 }
 
-function filter (data, args, set, seen) {
-  if (!set) set = {}
-  if (!seen) seen = {}
-  if (set.hasOwnProperty(data.path)) return set
-  if (seen.hasOwnProperty(data.path)) return set
-  seen[data.path] = true
-  var pass
-  if (!args.length) pass = true // rebuild everything
-  else if (data.name && data._id) {
-    for (var i = 0, l = args.length; i < l; i++) {
-      var arg = args[i]
-      var nv = npa(arg)
-      var n = nv.name
-      var v = nv.rawSpec
-      if (n !== data.name) continue
-      if (!semver.satisfies(data.version, v, true)) continue
-      pass = true
-      break
-    }
-  }
-  if (pass && data._id) {
-    log.verbose('rebuild', 'path, id', [data.path, data._id])
-    set[data.path] = data._id
-  }
-  // need to also dive through kids, always.
-  // since this isn't an install these won't get auto-built unless
-  // they're not dependencies.
-  Object.keys(data.dependencies || {}).forEach(function (d) {
-    // return
-    var dep = data.dependencies[d]
-    if (typeof dep === 'string') return
-    filter(dep, args, set, seen)
-  })
-  return set
+function cleanup () {
+  rimraf.sync(basepath)
 }
