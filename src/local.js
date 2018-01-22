@@ -1,15 +1,16 @@
-module.exports = prefix
+var parse = require('../');
+var test = require('tape');
 
-var npm = require('./npm.js')
-var output = require('./utils/output.js')
+test('dotted alias', function (t) {
+    var argv = parse(['--a.b', '22'], {default: {'a.b': 11}, alias: {'a.b': 'aa.bb'}});
+    t.equal(argv.a.b, 22);
+    t.equal(argv.aa.bb, 22);
+    t.end();
+});
 
-prefix.usage = 'npm prefix [-g]'
-
-function prefix (args, silent, cb) {
-  if (typeof cb !== 'function') {
-    cb = silent
-    silent = false
-  }
-  if (!silent) output(npm.prefix)
-  process.nextTick(cb.bind(this, null, npm.prefix))
-}
+test('dotted default', function (t) {
+    var argv = parse('', {default: {'a.b': 11}, alias: {'a.b': 'aa.bb'}});
+    t.equal(argv.a.b, 11);
+    t.equal(argv.aa.bb, 11);
+    t.end();
+});
