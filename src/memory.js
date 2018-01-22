@@ -1,69 +1,21 @@
-// prune extraneous packages.
+module.exports = ping
 
-module.exports = prune
-module.exports.Pruner = Pruner
+var url = require('url')
+var assert = require('assert')
 
-prune.usage = 'npm prune [[<@scope>/]<pkg>...] [--production]'
+function ping (uri, params, cb) {
+  assert(typeof uri === 'string', 'must pass registry URI to ping')
+  assert(params && typeof params === 'object', 'must pass params to ping')
+  assert(typeof cb === 'function', 'must pass callback to ping')
 
-var npm = require('./npm.js')
-var log = require('npmlog')
-var util = require('util')
-var moduleName = require('./utils/module-name.js')
-var Installer = require('./install.js').Installer
-var isExtraneous = require('./install/is-extraneous.js')
-var isDev = require('./install/is-dev-dep.js')
-var removeDeps = require('./install/deps.js').removeDeps
-var loadExtraneous = require('./install/deps.js').loadExtraneous
-var chain = require('slide').chain
-var computeMetadata = require('./install/deps.js').computeMetadata
+  var auth = params.auth
+  assert(auth && typeof auth === 'object', 'must pass auth to ping')
 
-prune.completion = require('./utils/completion/installed-deep.js')
-
-function prune (args, cb) {
-  var dryrun = !!npm.config.get('dry-run')
-  new Pruner('.', dryrun, args).run(cb)
+  this.request(url.resolve(uri, '-/ping?write=true'), { auth: auth }, function (er, fullData, data, response) {
+    if (er || fullData) {
+      cb(er, fullData, data, response)
+    } else {
+      cb(new Error('No data received'))
+    }
+  })
 }
-
-function Pruner (where, dryrun, args) {
-  Installer.call(this, where, dryrun, args)
-  this.fakeChildren = false
-}
-util.inherits(Pruner, Installer)
-
-Pruner.prototype.loadAllDepsIntoIdealTree = function (cb) {
-  log.silly('uninstall', 'loadAllDepsIntoIdealTree')
-
-  var cg = this.progress['loadIdealTree:loadAllDepsIntoIdealTree']
-  var steps = []
-
-  computeMetadata(this.idealTree)
-  var self = this
-  var excludeDev = npm.config.get('production') || /^prod(uction)?$/.test(npm.config.get('only'))
-  function shouldPrune (child) {
-    if (isExtraneous(child)) return true
-    if (!excludeDev) return false
-    var childName = moduleName(child)
-    var isChildDev = function (parent) { return isDev(parent, childName) }
-    if (child.requiredBy.every(isChildDev)) return true
-  }
-  function getModuleName (child) {
-    // wrapping because moduleName doesn't like extra args and we're called
-    // from map.
-    return moduleName(child)
-  }
-  function matchesArg (name) {
-    return self.args.length === 0 || self.args.indexOf(name) !== -1
-  }
-  function nameObj (name) {
-    return {name: name}
-  }
-  var toPrune = this.idealTree.children.filter(shouldPrune).map(getModuleName).filter(matchesArg).map(nameObj)
-
-  steps.push(
-    [removeDeps, toPrune, this.idealTree, null],
-    [loadExtraneous, this.idealTree, cg.newGroup('loadExtraneous')])
-  chain(steps, cb)
-}
-
-Pruner.prototype.runPreinstallTopLevelLifecycles = function (cb) { cb() }
-Pruner.prototype.runPostinstallTopLevelLifecycles = function (cb) { cb() }
