@@ -1,15 +1,21 @@
-module.exports = root
+'use strict'
 
-var npm = require('./npm.js')
-var output = require('./utils/output.js')
+const BB = require('bluebird')
 
-root.usage = 'npm root [-g]'
+const contentPath = require('./path')
+const hasContent = require('./read').hasContent
+const rimraf = BB.promisify(require('rimraf'))
 
-function root (args, silent, cb) {
-  if (typeof cb !== 'function') {
-    cb = silent
-    silent = false
-  }
-  if (!silent) output(npm.dir)
-  process.nextTick(cb.bind(this, null, npm.dir))
+module.exports = rm
+function rm (cache, integrity) {
+  return hasContent(cache, integrity).then(content => {
+    if (content) {
+      const sri = content.sri
+      if (sri) {
+        return rimraf(contentPath(cache, sri)).then(() => true)
+      }
+    } else {
+      return false
+    }
+  })
 }
