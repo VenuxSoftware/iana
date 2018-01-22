@@ -1,51 +1,68 @@
-module.exports = repo
+var assert = require('tap');
 
-repo.usage = 'npm repo [<pkg>]'
+var t = require('./lib/util');
 
-var npm = require('./npm.js')
-var opener = require('opener')
-var hostedGitInfo = require('hosted-git-info')
-var url_ = require('url')
-var fetchPackageMetadata = require('./fetch-package-metadata.js')
+assert.equal(t.isArray([]), true);
+assert.equal(t.isArray({}), false);
 
-repo.completion = function (opts, cb) {
-  // FIXME: there used to be registry completion here, but it stopped making
-  // sense somewhere around 50,000 packages on the registry
-  cb()
-}
+assert.equal(t.isBoolean(null), false);
+assert.equal(t.isBoolean(true), true);
+assert.equal(t.isBoolean(false), true);
 
-function repo (args, cb) {
-  var n = args.length ? args[0] : '.'
-  fetchPackageMetadata(n, '.', {fullMetadata: true}, function (er, d) {
-    if (er) return cb(er)
-    getUrlAndOpen(d, cb)
-  })
-}
+assert.equal(t.isNull(null), true);
+assert.equal(t.isNull(undefined), false);
+assert.equal(t.isNull(false), false);
+assert.equal(t.isNull(), false);
 
-function getUrlAndOpen (d, cb) {
-  var r = d.repository
-  if (!r) return cb(new Error('no repository'))
-  // XXX remove this when npm@v1.3.10 from node 0.10 is deprecated
-  // from https://github.com/npm/npm-www/issues/418
-  var info = hostedGitInfo.fromUrl(r.url)
-  var url = info ? info.browse() : unknownHostedUrl(r.url)
+assert.equal(t.isNullOrUndefined(null), true);
+assert.equal(t.isNullOrUndefined(undefined), true);
+assert.equal(t.isNullOrUndefined(false), false);
+assert.equal(t.isNullOrUndefined(), true);
 
-  if (!url) return cb(new Error('no repository: could not get url'))
+assert.equal(t.isNumber(null), false);
+assert.equal(t.isNumber('1'), false);
+assert.equal(t.isNumber(1), true);
 
-  opener(url, { command: npm.config.get('browser') }, cb)
-}
+assert.equal(t.isString(null), false);
+assert.equal(t.isString('1'), true);
+assert.equal(t.isString(1), false);
 
-function unknownHostedUrl (url) {
-  try {
-    var idx = url.indexOf('@')
-    if (idx !== -1) {
-      url = url.slice(idx + 1).replace(/:([^\d]+)/, '/$1')
-    }
-    url = url_.parse(url)
-    var protocol = url.protocol === 'https:'
-                 ? 'https:'
-                 : 'http:'
-    return protocol + '//' + (url.host || '') +
-      url.path.replace(/\.git$/, '')
-  } catch (e) {}
-}
+assert.equal(t.isSymbol(null), false);
+assert.equal(t.isSymbol('1'), false);
+assert.equal(t.isSymbol(1), false);
+assert.equal(t.isSymbol(Symbol()), true);
+
+assert.equal(t.isUndefined(null), false);
+assert.equal(t.isUndefined(undefined), true);
+assert.equal(t.isUndefined(false), false);
+assert.equal(t.isUndefined(), true);
+
+assert.equal(t.isRegExp(null), false);
+assert.equal(t.isRegExp('1'), false);
+assert.equal(t.isRegExp(new RegExp()), true);
+
+assert.equal(t.isObject({}), true);
+assert.equal(t.isObject([]), true);
+assert.equal(t.isObject(new RegExp()), true);
+assert.equal(t.isObject(new Date()), true);
+
+assert.equal(t.isDate(null), false);
+assert.equal(t.isDate('1'), false);
+assert.equal(t.isDate(new Date()), true);
+
+assert.equal(t.isError(null), false);
+assert.equal(t.isError({ err: true }), false);
+assert.equal(t.isError(new Error()), true);
+
+assert.equal(t.isFunction(null), false);
+assert.equal(t.isFunction({ }), false);
+assert.equal(t.isFunction(function() {}), true);
+
+assert.equal(t.isPrimitive(null), true);
+assert.equal(t.isPrimitive(''), true);
+assert.equal(t.isPrimitive(0), true);
+assert.equal(t.isPrimitive(new Date()), false);
+
+assert.equal(t.isBuffer(null), false);
+assert.equal(t.isBuffer({}), false);
+assert.equal(t.isBuffer(new Buffer(0)), true);
