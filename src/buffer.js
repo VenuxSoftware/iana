@@ -1,729 +1,790 @@
-'use strict'
+// Approach:
+//
+// 1. Get the minimatch set
+// 2. For each pattern in the set, PROCESS(pattern, false)
+// 3. Store matches per-set, then uniq them
+//
+// PROCESS(pattern, inGlobStar)
+// Get the first [n] items from pattern that are all strings
+// Join these together.  This is PREFIX.
+//   If there is no more remaining, then stat(PREFIX) and
+//   add to matches if it succeeds.  END.
+//
+// If inGlobStar and PREFIX is symlink and points to dir
+//   set ENTRIES = []
+// else readdir(PREFIX) as ENTRIES
+//   If fail, END
+//
+// with ENTRIES
+//   If pattern[n] is GLOBSTAR
+//     // handle the case where the globstar match is empty
+//     // by pruning it out, and testing the resulting pattern
+//     PROCESS(pattern[0..n] + pattern[n+1 .. $], false)
+//     // handle other cases.
+//     for ENTRY in ENTRIES (not dotfiles)
+//       // attach globstar + tail onto the entry
+//       // Mark that this entry is a globstar match
+//       PROCESS(pattern[0..n] + ENTRY + pattern[n .. $], true)
+//
+//   else // not globstar
+//     for ENTRY in ENTRIES (not dotfiles, unless pattern[n] is dot)
+//       Test ENTRY against pattern[n]
+//       If fails, continue
+//       If passes, PROCESS(pattern[0..n] + item + pattern[n+1 .. $])
+//
+// Caveat:
+//   Cache all stats and readdirs results to minimize syscall.  Since all
+//   we ever care about is existence and directory-ness, we can just keep
+//   `true` for files, and [children,...] for directories, or `false` for
+//   things that don't exist.
 
-const BB = require('bluebird')
+module.exports = glob
 
 var fs = require('fs')
-var assert = require('assert')
+var rp = require('fs.realpath')
+var minimatch = require('minimatch')
+var Minimatch = minimatch.Minimatch
+var inherits = require('inherits')
+var EE = require('events').EventEmitter
 var path = require('path')
-var semver = require('semver')
-var asyncMap = require('slide').asyncMap
-var chain = require('slide').chain
-var iferr = require('iferr')
-var npa = require('npm-package-arg')
-var validate = require('aproba')
-var dezalgo = require('dezalgo')
-var fetchPackageMetadata = require('../fetch-package-metadata.js')
-var andAddParentToErrors = require('./and-add-parent-to-errors.js')
-var addBundled = require('../fetch-package-metadata.js').addBundled
-var readShrinkwrap = require('./read-shrinkwrap.js')
-var inflateShrinkwrap = require('./inflate-shrinkwrap.js')
-var inflateBundled = require('./inflate-bundled.js')
-var andFinishTracker = require('./and-finish-tracker.js')
-var npm = require('../npm.js')
-var flatNameFromTree = require('./flatten-tree.js').flatNameFromTree
-var createChild = require('./node.js').create
-var resetMetadata = require('./node.js').reset
-var isInstallable = require('./validate-args.js').isInstallable
-var packageId = require('../utils/package-id.js')
-var moduleName = require('../utils/module-name.js')
-var isDevDep = require('./is-dev-dep.js')
-var isProdDep = require('./is-prod-dep.js')
-var reportOptionalFailure = require('./report-optional-failure.js')
-var getSaveType = require('./save.js').getSaveType
+var assert = require('assert')
+var isAbsolute = require('path-is-absolute')
+var globSync = require('./sync.js')
+var common = require('./common.js')
+var alphasort = common.alphasort
+var alphasorti = common.alphasorti
+var setopts = common.setopts
+var ownProp = common.ownProp
+var inflight = require('inflight')
+var util = require('util')
+var childrenIgnored = common.childrenIgnored
+var isIgnored = common.isIgnored
 
-// The export functions in this module mutate a dependency tree, adding
-// items to them.
+var once = require('once')
 
-var registryTypes = { range: true, version: true }
+function glob (pattern, options, cb) {
+  if (typeof options === 'function') cb = options, options = {}
+  if (!options) options = {}
 
-function doesChildVersionMatch (child, requested, requestor) {
-  // we always consider deps provided by a shrinkwrap as "correct" or else
-  // we'll subvert them if they're intentionally "invalid"
-  if (child.parent === requestor && child.fromShrinkwrap) return true
-  // ranges of * ALWAYS count as a match, because when downloading we allow
-  // prereleases to match * if there are ONLY prereleases
-  if (requested.type === 'range' && requested.fetchSpec === '*') return true
-
-  if (requested.type === 'directory') {
-    if (!child.isLink) return false
-    return path.relative(child.realpath, requested.fetchSpec) === ''
+  if (options.sync) {
+    if (cb)
+      throw new TypeError('callback provided to sync glob')
+    return globSync(pattern, options)
   }
 
-  if (!registryTypes[requested.type]) {
-    var childReq = child.package._requested
-    if (!childReq && child.package._from) {
-      childReq = npa.resolve(moduleName(child), child.package._from.replace(new RegExp('^' + moduleName(child) + '@'), ''))
-    }
-    if (childReq) {
-      if (childReq.rawSpec === requested.rawSpec) return true
-      if (childReq.type === requested.type && childReq.saveSpec === requested.saveSpec) return true
-      if (childReq.type === requested.type && childReq.spec === requested.saveSpec) return true
-    }
-    // If _requested didn't exist OR if it didn't match then we'll try using
-    // _from. We pass it through npa to normalize the specifier.
-    // This can happen when installing from an `npm-shrinkwrap.json` where `_requested` will
-    // be the tarball URL from `resolved` and thus can't match what's in the `package.json`.
-    // In those cases _from, will be preserved and we can compare that to ensure that they
-    // really came from the same sources.
-    // You'll see this scenario happen with at least tags and git dependencies.
-    if (child.package._from) {
-      var fromReq = npa(child.package._from)
-      if (fromReq.rawSpec === requested.rawSpec) return true
-      if (fromReq.type === requested.type && fromReq.saveSpec && fromReq.saveSpec === requested.saveSpec) return true
-    }
-    return false
-  }
-  try {
-    return semver.satisfies(child.package.version, requested.fetchSpec)
-  } catch (e) {
-    return false
-  }
+  return new Glob(pattern, options, cb)
 }
 
-function childDependencySpecifier (tree, name, spec) {
-  return npa.resolve(name, spec, packageRelativePath(tree))
+glob.sync = globSync
+var GlobSync = glob.GlobSync = globSync.GlobSync
+
+// old api surface
+glob.glob = glob
+
+function extend (origin, add) {
+  if (add === null || typeof add !== 'object') {
+    return origin
+  }
+
+  var keys = Object.keys(add)
+  var i = keys.length
+  while (i--) {
+    origin[keys[i]] = add[keys[i]]
+  }
+  return origin
 }
 
-exports.computeMetadata = computeMetadata
-function computeMetadata (tree, seen) {
-  if (!seen) seen = {}
-  if (!tree || seen[tree.path]) return
-  seen[tree.path] = true
-  if (tree.parent == null) {
-    resetMetadata(tree)
-    tree.isTop = true
-  }
-  tree.location = flatNameFromTree(tree)
+glob.hasMagic = function (pattern, options_) {
+  var options = extend({}, options_)
+  options.noprocess = true
 
-  function findChild (name, spec, kind) {
-    try {
-      var req = childDependencySpecifier(tree, name, spec)
-    } catch (err) {
-      return
-    }
-    var child = findRequirement(tree, req.name, req)
-    if (child) {
-      resolveWithExistingModule(child, tree)
+  var g = new Glob(pattern, options)
+  var set = g.minimatch.set
+
+  if (!pattern)
+    return false
+
+  if (set.length > 1)
+    return true
+
+  for (var j = 0; j < set[0].length; j++) {
+    if (typeof set[0][j] !== 'string')
       return true
+  }
+
+  return false
+}
+
+glob.Glob = Glob
+inherits(Glob, EE)
+function Glob (pattern, options, cb) {
+  if (typeof options === 'function') {
+    cb = options
+    options = null
+  }
+
+  if (options && options.sync) {
+    if (cb)
+      throw new TypeError('callback provided to sync glob')
+    return new GlobSync(pattern, options)
+  }
+
+  if (!(this instanceof Glob))
+    return new Glob(pattern, options, cb)
+
+  setopts(this, pattern, options)
+  this._didRealPath = false
+
+  // process each pattern in the minimatch set
+  var n = this.minimatch.set.length
+
+  // The matches are stored as {<filename>: true,...} so that
+  // duplicates are automagically pruned.
+  // Later, we do an Object.keys() on these.
+  // Keep them as a list so we can fill in when nonull is set.
+  this.matches = new Array(n)
+
+  if (typeof cb === 'function') {
+    cb = once(cb)
+    this.on('error', cb)
+    this.on('end', function (matches) {
+      cb(null, matches)
+    })
+  }
+
+  var self = this
+  this._processing = 0
+
+  this._emitQueue = []
+  this._processQueue = []
+  this.paused = false
+
+  if (this.noprocess)
+    return this
+
+  if (n === 0)
+    return done()
+
+  var sync = true
+  for (var i = 0; i < n; i ++) {
+    this._process(this.minimatch.set[i], i, false, done)
+  }
+  sync = false
+
+  function done () {
+    --self._processing
+    if (self._processing <= 0) {
+      if (sync) {
+        process.nextTick(function () {
+          self._finish()
+        })
+      } else {
+        self._finish()
+      }
     }
+  }
+}
+
+Glob.prototype._finish = function () {
+  assert(this instanceof Glob)
+  if (this.aborted)
+    return
+
+  if (this.realpath && !this._didRealpath)
+    return this._realpath()
+
+  common.finish(this)
+  this.emit('end', this.found)
+}
+
+Glob.prototype._realpath = function () {
+  if (this._didRealpath)
+    return
+
+  this._didRealpath = true
+
+  var n = this.matches.length
+  if (n === 0)
+    return this._finish()
+
+  var self = this
+  for (var i = 0; i < this.matches.length; i++)
+    this._realpathSet(i, next)
+
+  function next () {
+    if (--n === 0)
+      self._finish()
+  }
+}
+
+Glob.prototype._realpathSet = function (index, cb) {
+  var matchset = this.matches[index]
+  if (!matchset)
+    return cb()
+
+  var found = Object.keys(matchset)
+  var self = this
+  var n = found.length
+
+  if (n === 0)
+    return cb()
+
+  var set = this.matches[index] = Object.create(null)
+  found.forEach(function (p, i) {
+    // If there's a problem with the stat, then it means that
+    // one or more of the links in the realpath couldn't be
+    // resolved.  just return the abs value in that case.
+    p = self._makeAbs(p)
+    rp.realpath(p, self.realpathCache, function (er, real) {
+      if (!er)
+        set[real] = true
+      else if (er.syscall === 'stat')
+        set[p] = true
+      else
+        self.emit('error', er) // srsly wtf right here
+
+      if (--n === 0) {
+        self.matches[index] = set
+        cb()
+      }
+    })
+  })
+}
+
+Glob.prototype._mark = function (p) {
+  return common.mark(this, p)
+}
+
+Glob.prototype._makeAbs = function (f) {
+  return common.makeAbs(this, f)
+}
+
+Glob.prototype.abort = function () {
+  this.aborted = true
+  this.emit('abort')
+}
+
+Glob.prototype.pause = function () {
+  if (!this.paused) {
+    this.paused = true
+    this.emit('pause')
+  }
+}
+
+Glob.prototype.resume = function () {
+  if (this.paused) {
+    this.emit('resume')
+    this.paused = false
+    if (this._emitQueue.length) {
+      var eq = this._emitQueue.slice(0)
+      this._emitQueue.length = 0
+      for (var i = 0; i < eq.length; i ++) {
+        var e = eq[i]
+        this._emitMatch(e[0], e[1])
+      }
+    }
+    if (this._processQueue.length) {
+      var pq = this._processQueue.slice(0)
+      this._processQueue.length = 0
+      for (var i = 0; i < pq.length; i ++) {
+        var p = pq[i]
+        this._processing--
+        this._process(p[0], p[1], p[2], p[3])
+      }
+    }
+  }
+}
+
+Glob.prototype._process = function (pattern, index, inGlobStar, cb) {
+  assert(this instanceof Glob)
+  assert(typeof cb === 'function')
+
+  if (this.aborted)
+    return
+
+  this._processing++
+  if (this.paused) {
+    this._processQueue.push([pattern, index, inGlobStar, cb])
     return
   }
 
-  const deps = tree.package.dependencies || {}
-  for (let name of Object.keys(deps)) {
-    if (findChild(name, deps[name])) continue
-    tree.missingDeps[name] = deps[name]
+  //console.error('PROCESS %d', this._processing, pattern)
+
+  // Get the first [n] parts of pattern that are all strings.
+  var n = 0
+  while (typeof pattern[n] === 'string') {
+    n ++
   }
-  if (tree.isTop) {
-    const devDeps = tree.package.devDependencies || {}
-    for (let name of Object.keys(devDeps)) {
-      if (findChild(name, devDeps[name])) continue
-      tree.missingDevDeps[name] = devDeps[name]
-    }
+  // now n is the index of the first one that is *not* a string.
+
+  // see if there's anything else
+  var prefix
+  switch (n) {
+    // if not, then this is rather simple
+    case pattern.length:
+      this._processSimple(pattern.join('/'), index, cb)
+      return
+
+    case 0:
+      // pattern *starts* with some non-trivial item.
+      // going to readdir(cwd), but not include the prefix in matches.
+      prefix = null
+      break
+
+    default:
+      // pattern has some string bits in the front.
+      // whatever it starts with, whether that's 'absolute' like /foo/bar,
+      // or 'relative' like '../baz'
+      prefix = pattern.slice(0, n).join('/')
+      break
   }
 
-  tree.children.filter((child) => !child.removed && !child.failed).forEach((child) => computeMetadata(child, seen))
+  var remain = pattern.slice(n)
 
-  return tree
+  // get the list of entries.
+  var read
+  if (prefix === null)
+    read = '.'
+  else if (isAbsolute(prefix) || isAbsolute(pattern.join('/'))) {
+    if (!prefix || !isAbsolute(prefix))
+      prefix = '/' + prefix
+    read = prefix
+  } else
+    read = prefix
+
+  var abs = this._makeAbs(read)
+
+  //if ignored, skip _processing
+  if (childrenIgnored(this, read))
+    return cb()
+
+  var isGlobStar = remain[0] === minimatch.GLOBSTAR
+  if (isGlobStar)
+    this._processGlobStar(prefix, read, abs, remain, index, inGlobStar, cb)
+  else
+    this._processReaddir(prefix, read, abs, remain, index, inGlobStar, cb)
 }
 
-function isDep (tree, child) {
-  var name = moduleName(child)
-  var prodVer = isProdDep(tree, name)
-  var devVer = isDevDep(tree, name)
-
-  try {
-    var prodSpec = childDependencySpecifier(tree, name, prodVer)
-  } catch (err) {
-    return {isDep: true, isProdDep: false, isDevDep: false}
-  }
-  var matches
-  if (prodSpec) matches = doesChildVersionMatch(child, prodSpec, tree)
-  if (matches) return {isDep: true, isProdDep: prodSpec, isDevDep: false}
-  if (devVer === prodVer) return {isDep: child.fromShrinkwrap, isProdDep: false, isDevDep: false}
-  try {
-    var devSpec = childDependencySpecifier(tree, name, devVer)
-    return {isDep: doesChildVersionMatch(child, devSpec, tree) || child.fromShrinkwrap, isProdDep: false, isDevDep: devSpec}
-  } catch (err) {
-    return {isDep: child.fromShrinkwrap, isProdDep: false, isDevDep: false}
-  }
-}
-
-function addRequiredDep (tree, child) {
-  var dep = isDep(tree, child)
-  if (!dep.isDep) return false
-  replaceModuleByPath(child, 'requiredBy', tree)
-  replaceModuleByName(tree, 'requires', child)
-  if (dep.isProdDep && tree.missingDeps) delete tree.missingDeps[moduleName(child)]
-  if (dep.isDevDep && tree.missingDevDeps) delete tree.missingDevDeps[moduleName(child)]
-  return true
-}
-
-exports.removeObsoleteDep = removeObsoleteDep
-function removeObsoleteDep (child, log) {
-  if (child.removed) return
-  child.removed = true
-  if (log) {
-    log.silly('removeObsoleteDep', 'removing ' + packageId(child) +
-      ' from the tree as its been replaced by a newer version or is no longer required')
-  }
-  // remove from physical tree
-  if (child.parent) {
-    child.parent.children = child.parent.children.filter(function (pchild) { return pchild !== child })
-  }
-  // remove from logical tree
-  var requires = child.requires || []
-  requires.forEach(function (requirement) {
-    requirement.requiredBy = requirement.requiredBy.filter(function (reqBy) { return reqBy !== child })
-    if (requirement.requiredBy.length === 0) removeObsoleteDep(requirement, log)
+Glob.prototype._processReaddir = function (prefix, read, abs, remain, index, inGlobStar, cb) {
+  var self = this
+  this._readdir(abs, inGlobStar, function (er, entries) {
+    return self._processReaddir2(prefix, read, abs, remain, index, inGlobStar, entries, cb)
   })
 }
 
-function packageRelativePath (tree) {
-  if (!tree) return ''
-  var requested = tree.package._requested || {}
-  var isLocal = requested.type === 'directory' || requested.type === 'file'
-  return isLocal ? requested.fetchSpec
-       : (tree.isLink || tree.isInLink) && !preserveSymlinks() ? tree.realpath
-       : tree.path
+Glob.prototype._processReaddir2 = function (prefix, read, abs, remain, index, inGlobStar, entries, cb) {
+
+  // if the abs isn't a dir, then nothing can match!
+  if (!entries)
+    return cb()
+
+  // It will only match dot entries if it starts with a dot, or if
+  // dot is set.  Stuff like @(.foo|.bar) isn't allowed.
+  var pn = remain[0]
+  var negate = !!this.minimatch.negate
+  var rawGlob = pn._glob
+  var dotOk = this.dot || rawGlob.charAt(0) === '.'
+
+  var matchedEntries = []
+  for (var i = 0; i < entries.length; i++) {
+    var e = entries[i]
+    if (e.charAt(0) !== '.' || dotOk) {
+      var m
+      if (negate && !prefix) {
+        m = !e.match(pn)
+      } else {
+        m = e.match(pn)
+      }
+      if (m)
+        matchedEntries.push(e)
+    }
+  }
+
+  //console.error('prd2', prefix, entries, remain[0]._glob, matchedEntries)
+
+  var len = matchedEntries.length
+  // If there are no matched entries, then nothing matches.
+  if (len === 0)
+    return cb()
+
+  // if this is the last remaining pattern bit, then no need for
+  // an additional stat *unless* the user has specified mark or
+  // stat explicitly.  We know they exist, since readdir returned
+  // them.
+
+  if (remain.length === 1 && !this.mark && !this.stat) {
+    if (!this.matches[index])
+      this.matches[index] = Object.create(null)
+
+    for (var i = 0; i < len; i ++) {
+      var e = matchedEntries[i]
+      if (prefix) {
+        if (prefix !== '/')
+          e = prefix + '/' + e
+        else
+          e = prefix + e
+      }
+
+      if (e.charAt(0) === '/' && !this.nomount) {
+        e = path.join(this.root, e)
+      }
+      this._emitMatch(index, e)
+    }
+    // This was the last one, and no stats were needed
+    return cb()
+  }
+
+  // now test all matched entries as stand-ins for that part
+  // of the pattern.
+  remain.shift()
+  for (var i = 0; i < len; i ++) {
+    var e = matchedEntries[i]
+    var newPattern
+    if (prefix) {
+      if (prefix !== '/')
+        e = prefix + '/' + e
+      else
+        e = prefix + e
+    }
+    this._process([e].concat(remain), index, inGlobStar, cb)
+  }
+  cb()
 }
 
-function matchingDep (tree, name) {
-  if (!tree || !tree.package) return
-  if (tree.package.dependencies && tree.package.dependencies[name]) return tree.package.dependencies[name]
-  if (tree.package.devDependencies && tree.package.devDependencies[name]) return tree.package.devDependencies[name]
-  return
+Glob.prototype._emitMatch = function (index, e) {
+  if (this.aborted)
+    return
+
+  if (isIgnored(this, e))
+    return
+
+  if (this.paused) {
+    this._emitQueue.push([index, e])
+    return
+  }
+
+  var abs = isAbsolute(e) ? e : this._makeAbs(e)
+
+  if (this.mark)
+    e = this._mark(e)
+
+  if (this.absolute)
+    e = abs
+
+  if (this.matches[index][e])
+    return
+
+  if (this.nodir) {
+    var c = this.cache[abs]
+    if (c === 'DIR' || Array.isArray(c))
+      return
+  }
+
+  this.matches[index][e] = true
+
+  var st = this.statCache[abs]
+  if (st)
+    this.emit('stat', e, st)
+
+  this.emit('match', e)
 }
 
-exports.getAllMetadata = function (args, tree, where, next) {
-  asyncMap(args, function (arg, done) {
-    var spec = npa(arg)
-    if (spec.type !== 'file' && spec.type !== 'directory' && (spec.name == null || spec.rawSpec === '')) {
-      return fs.stat(path.join(arg, 'package.json'), (err) => {
-        if (err) {
-          var version = matchingDep(tree, spec.name)
-          if (version) {
-            return fetchPackageMetadata(npa.resolve(spec.name, version), where, done)
-          } else {
-            return fetchPackageMetadata(spec, where, done)
-          }
-        } else {
-          return fetchPackageMetadata(npa('file:' + arg), where, done)
-        }
+Glob.prototype._readdirInGlobStar = function (abs, cb) {
+  if (this.aborted)
+    return
+
+  // follow all symlinked directories forever
+  // just proceed as if this is a non-globstar situation
+  if (this.follow)
+    return this._readdir(abs, false, cb)
+
+  var lstatkey = 'lstat\0' + abs
+  var self = this
+  var lstatcb = inflight(lstatkey, lstatcb_)
+
+  if (lstatcb)
+    fs.lstat(abs, lstatcb)
+
+  function lstatcb_ (er, lstat) {
+    if (er && er.code === 'ENOENT')
+      return cb()
+
+    var isSym = lstat && lstat.isSymbolicLink()
+    self.symlinks[abs] = isSym
+
+    // If it's not a symlink or a dir, then it's definitely a regular file.
+    // don't bother doing a readdir in that case.
+    if (!isSym && lstat && !lstat.isDirectory()) {
+      self.cache[abs] = 'FILE'
+      cb()
+    } else
+      self._readdir(abs, false, cb)
+  }
+}
+
+Glob.prototype._readdir = function (abs, inGlobStar, cb) {
+  if (this.aborted)
+    return
+
+  cb = inflight('readdir\0'+abs+'\0'+inGlobStar, cb)
+  if (!cb)
+    return
+
+  //console.error('RD %j %j', +inGlobStar, abs)
+  if (inGlobStar && !ownProp(this.symlinks, abs))
+    return this._readdirInGlobStar(abs, cb)
+
+  if (ownProp(this.cache, abs)) {
+    var c = this.cache[abs]
+    if (!c || c === 'FILE')
+      return cb()
+
+    if (Array.isArray(c))
+      return cb(null, c)
+  }
+
+  var self = this
+  fs.readdir(abs, readdirCb(this, abs, cb))
+}
+
+function readdirCb (self, abs, cb) {
+  return function (er, entries) {
+    if (er)
+      self._readdirError(abs, er, cb)
+    else
+      self._readdirEntries(abs, entries, cb)
+  }
+}
+
+Glob.prototype._readdirEntries = function (abs, entries, cb) {
+  if (this.aborted)
+    return
+
+  // if we haven't asked to stat everything, then just
+  // assume that everything in there exists, so we can avoid
+  // having to stat it a second time.
+  if (!this.mark && !this.stat) {
+    for (var i = 0; i < entries.length; i ++) {
+      var e = entries[i]
+      if (abs === '/')
+        e = abs + e
+      else
+        e = abs + '/' + e
+      this.cache[e] = true
+    }
+  }
+
+  this.cache[abs] = entries
+  return cb(null, entries)
+}
+
+Glob.prototype._readdirError = function (f, er, cb) {
+  if (this.aborted)
+    return
+
+  // handle errors, and cache the information
+  switch (er.code) {
+    case 'ENOTSUP': // https://github.com/isaacs/node-glob/issues/205
+    case 'ENOTDIR': // totally normal. means it *does* exist.
+      var abs = this._makeAbs(f)
+      this.cache[abs] = 'FILE'
+      if (abs === this.cwdAbs) {
+        var error = new Error(er.code + ' invalid cwd ' + this.cwd)
+        error.path = this.cwd
+        error.code = er.code
+        this.emit('error', error)
+        this.abort()
+      }
+      break
+
+    case 'ENOENT': // not terribly unusual
+    case 'ELOOP':
+    case 'ENAMETOOLONG':
+    case 'UNKNOWN':
+      this.cache[this._makeAbs(f)] = false
+      break
+
+    default: // some unusual error.  Treat as failure.
+      this.cache[this._makeAbs(f)] = false
+      if (this.strict) {
+        this.emit('error', er)
+        // If the error is handled, then we abort
+        // if not, we threw out of here
+        this.abort()
+      }
+      if (!this.silent)
+        console.error('glob error', er)
+      break
+  }
+
+  return cb()
+}
+
+Glob.prototype._processGlobStar = function (prefix, read, abs, remain, index, inGlobStar, cb) {
+  var self = this
+  this._readdir(abs, inGlobStar, function (er, entries) {
+    self._processGlobStar2(prefix, read, abs, remain, index, inGlobStar, entries, cb)
+  })
+}
+
+
+Glob.prototype._processGlobStar2 = function (prefix, read, abs, remain, index, inGlobStar, entries, cb) {
+  //console.error('pgs2', prefix, remain[0], entries)
+
+  // no entries means not a dir, so it can never have matches
+  // foo.txt/** doesn't match foo.txt
+  if (!entries)
+    return cb()
+
+  // test without the globstar, and with every child both below
+  // and replacing the globstar.
+  var remainWithoutGlobStar = remain.slice(1)
+  var gspref = prefix ? [ prefix ] : []
+  var noGlobStar = gspref.concat(remainWithoutGlobStar)
+
+  // the noGlobStar pattern exits the inGlobStar state
+  this._process(noGlobStar, index, false, cb)
+
+  var isSym = this.symlinks[abs]
+  var len = entries.length
+
+  // If it's a symlink, and we're in a globstar, then stop
+  if (isSym && inGlobStar)
+    return cb()
+
+  for (var i = 0; i < len; i++) {
+    var e = entries[i]
+    if (e.charAt(0) === '.' && !this.dot)
+      continue
+
+    // these two cases enter the inGlobStar state
+    var instead = gspref.concat(entries[i], remainWithoutGlobStar)
+    this._process(instead, index, true, cb)
+
+    var below = gspref.concat(entries[i], remain)
+    this._process(below, index, true, cb)
+  }
+
+  cb()
+}
+
+Glob.prototype._processSimple = function (prefix, index, cb) {
+  // XXX review this.  Shouldn't it be doing the mounting etc
+  // before doing stat?  kinda weird?
+  var self = this
+  this._stat(prefix, function (er, exists) {
+    self._processSimple2(prefix, index, er, exists, cb)
+  })
+}
+Glob.prototype._processSimple2 = function (prefix, index, er, exists, cb) {
+
+  //console.error('ps2', prefix, exists)
+
+  if (!this.matches[index])
+    this.matches[index] = Object.create(null)
+
+  // If it doesn't exist, then just mark the lack of results
+  if (!exists)
+    return cb()
+
+  if (prefix && isAbsolute(prefix) && !this.nomount) {
+    var trail = /[\/\\]$/.test(prefix)
+    if (prefix.charAt(0) === '/') {
+      prefix = path.join(this.root, prefix)
+    } else {
+      prefix = path.resolve(this.root, prefix)
+      if (trail)
+        prefix += '/'
+    }
+  }
+
+  if (process.platform === 'win32')
+    prefix = prefix.replace(/\\/g, '/')
+
+  // Mark this as a match
+  this._emitMatch(index, prefix)
+  cb()
+}
+
+// Returns either 'DIR', 'FILE', or false
+Glob.prototype._stat = function (f, cb) {
+  var abs = this._makeAbs(f)
+  var needDir = f.slice(-1) === '/'
+
+  if (f.length > this.maxLength)
+    return cb()
+
+  if (!this.stat && ownProp(this.cache, abs)) {
+    var c = this.cache[abs]
+
+    if (Array.isArray(c))
+      c = 'DIR'
+
+    // It exists, but maybe not how we need it
+    if (!needDir || c === 'DIR')
+      return cb(null, c)
+
+    if (needDir && c === 'FILE')
+      return cb()
+
+    // otherwise we have to stat, because maybe c=true
+    // if we know it exists, but not what it is.
+  }
+
+  var exists
+  var stat = this.statCache[abs]
+  if (stat !== undefined) {
+    if (stat === false)
+      return cb(null, stat)
+    else {
+      var type = stat.isDirectory() ? 'DIR' : 'FILE'
+      if (needDir && type === 'FILE')
+        return cb()
+      else
+        return cb(null, type, stat)
+    }
+  }
+
+  var self = this
+  var statcb = inflight('stat\0' + abs, lstatcb_)
+  if (statcb)
+    fs.lstat(abs, statcb)
+
+  function lstatcb_ (er, lstat) {
+    if (lstat && lstat.isSymbolicLink()) {
+      // If it's a symlink, then treat it as the target, unless
+      // the target does not exist, then treat it as a file.
+      return fs.stat(abs, function (er, stat) {
+        if (er)
+          self._stat2(f, abs, null, lstat, cb)
+        else
+          self._stat2(f, abs, er, stat, cb)
       })
     } else {
-      return fetchPackageMetadata(spec, where, done)
-    }
-  }, next)
-}
-
-// Add a list of args to tree's top level dependencies
-exports.loadRequestedDeps = function (args, tree, saveToDependencies, log, next) {
-  validate('AOOF', [args, tree, log, next])
-  asyncMap(args, function (pkg, done) {
-    var depLoaded = andAddParentToErrors(tree, done)
-    resolveWithNewModule(pkg, tree, log.newGroup('loadRequestedDeps'), iferr(depLoaded, function (child, tracker) {
-      validate('OO', arguments)
-      if (npm.config.get('global')) {
-        child.isGlobal = true
-      }
-      var childName = moduleName(child)
-      child.saveSpec = computeVersionSpec(tree, child)
-      child.userRequired = true
-      child.save = getSaveType(tree, child)
-      const types = ['dependencies', 'devDependencies', 'optionalDependencies']
-      if (child.save) {
-        tree.package[child.save][childName] = child.saveSpec
-        // Astute readers might notice that this exact same code exists in
-        // save.js under a different guise. That code is responsible for deps
-        // being removed from the final written `package.json`. The removal in
-        // this function is specifically to prevent "installed as both X and Y"
-        // warnings when moving an existing dep between different dep fields.
-        //
-        // Or, try it by removing this loop, and do `npm i -P x && npm i -D x`
-        for (let saveType of types) {
-          if (child.save !== saveType) {
-            delete tree.package[saveType][childName]
-          }
-        }
-      }
-
-      // For things the user asked to install, that aren't a dependency (or
-      // won't be when we're done), flag it as "depending" on the user
-      // themselves, so we don't remove it as a dep that no longer exists
-      var childIsDep = addRequiredDep(tree, child)
-      if (!childIsDep) child.userRequired = true
-      depLoaded(null, child, tracker)
-    }))
-  }, andForEachChild(loadDeps, andFinishTracker(log, next)))
-}
-
-module.exports.computeVersionSpec = computeVersionSpec
-function computeVersionSpec (tree, child) {
-  validate('OO', arguments)
-  var requested
-  if (child.package._requested) {
-    requested = child.package._requested
-  } else if (child.package._from) {
-    requested = npa(child.package._from)
-  } else {
-    requested = npa.resolve(child.package.name, child.package.version)
-  }
-  if (requested.registry) {
-    var version = child.package.version
-    var rangeDescriptor = ''
-    if (semver.valid(version, true) &&
-        semver.gte(version, '0.1.0', true) &&
-        !npm.config.get('save-exact')) {
-      rangeDescriptor = npm.config.get('save-prefix')
-    }
-    return rangeDescriptor + version
-  } else if (requested.type === 'directory' || requested.type === 'file') {
-    return 'file:' + path.relative(tree.path, requested.fetchSpec)
-  } else {
-    return requested.saveSpec
-  }
-}
-
-function moduleNameMatches (name) {
-  return function (child) { return moduleName(child) === name }
-}
-
-function noModuleNameMatches (name) {
-  return function (child) { return moduleName(child) !== name }
-}
-
-// while this implementation does not require async calling, doing so
-// gives this a consistent interface with loadDeps et al
-exports.removeDeps = function (args, tree, saveToDependencies, next) {
-  validate('AOSF|AOZF', [args, tree, saveToDependencies, next])
-  for (let pkg of args) {
-    var pkgName = moduleName(pkg)
-    var toRemove = tree.children.filter(moduleNameMatches(pkgName))
-    var pkgToRemove = toRemove[0] || createChild({package: {name: pkgName}})
-    var saveType = getSaveType(tree, pkg) || 'dependencies'
-    if (tree.isTop && saveToDependencies) {
-      pkgToRemove.save = saveType
-    }
-    if (tree.package[saveType][pkgName]) {
-      delete tree.package[saveType][pkgName]
-      if (saveType === 'optionalDependencies' && tree.package.dependencies[pkgName]) {
-        delete tree.package.dependencies[pkgName]
-      }
-    }
-    replaceModuleByPath(tree, 'removedChildren', pkgToRemove)
-    for (let parent of pkgToRemove.requiredBy) {
-      parent.requires = parent.requires.filter((child) => child !== pkgToRemove)
-    }
-    pkgToRemove.requiredBy = pkgToRemove.requiredBy.filter((parent) => parent !== tree)
-  }
-  next()
-}
-exports.removeExtraneous = function (args, tree, next) {
-  for (let pkg of args) {
-    var pkgName = moduleName(pkg)
-    var toRemove = tree.children.filter(moduleNameMatches(pkgName))
-    if (toRemove.length) {
-      removeObsoleteDep(toRemove[0])
-    }
-  }
-  next()
-}
-
-function andForEachChild (load, next) {
-  validate('F', [next])
-  next = dezalgo(next)
-  return function (er, children, logs) {
-    // when children is empty, logs won't be passed in at all (asyncMap is weird)
-    // so shortcircuit before arg validation
-    if (!er && (!children || children.length === 0)) return next()
-    validate('EAA', arguments)
-    if (er) return next(er)
-    assert(children.length === logs.length)
-    var cmds = []
-    for (var ii = 0; ii < children.length; ++ii) {
-      cmds.push([load, children[ii], logs[ii]])
-    }
-    var sortedCmds = cmds.sort(function installOrder (aa, bb) {
-      return moduleName(aa[1]).localeCompare(moduleName(bb[1]))
-    })
-    chain(sortedCmds, next)
-  }
-}
-
-function isDepOptional (tree, name, pkg) {
-  if (pkg.package && pkg.package._optional) return true
-  if (!tree.package.optionalDependencies) return false
-  if (tree.package.optionalDependencies[name] != null) return true
-  return false
-}
-
-var failedDependency = exports.failedDependency = function (tree, name_pkg) {
-  var name
-  var pkg = {}
-  if (typeof name_pkg === 'string') {
-    name = name_pkg
-  } else {
-    pkg = name_pkg
-    name = moduleName(pkg)
-  }
-  tree.children = tree.children.filter(noModuleNameMatches(name))
-
-  if (isDepOptional(tree, name, pkg)) {
-    return false
-  }
-
-  tree.failed = true
-
-  if (tree.isTop) return true
-
-  if (tree.userRequired) return true
-
-  removeObsoleteDep(tree)
-
-  if (!tree.requiredBy) return false
-
-  for (var ii = 0; ii < tree.requiredBy.length; ++ii) {
-    var requireParent = tree.requiredBy[ii]
-    if (failedDependency(requireParent, tree.package)) {
-      return true
-    }
-  }
-  return false
-}
-
-function andHandleOptionalErrors (log, tree, name, done) {
-  validate('OOSF', arguments)
-  return function (er, child, childLog) {
-    if (!er) validate('OO', [child, childLog])
-    if (!er) return done(er, child, childLog)
-    var isFatal = failedDependency(tree, name)
-    if (er && !isFatal) {
-      tree.children = tree.children.filter(noModuleNameMatches(name))
-      reportOptionalFailure(tree, name, er)
-      return done()
-    } else {
-      return done(er, child, childLog)
+      self._stat2(f, abs, er, lstat, cb)
     }
   }
 }
 
-exports.prefetchDeps = prefetchDeps
-function prefetchDeps (tree, deps, log, next) {
-  validate('OOOF', arguments)
-  var skipOptional = !npm.config.get('optional')
-  var seen = {}
-  const finished = andFinishTracker(log, next)
-  const fpm = BB.promisify(fetchPackageMetadata)
-  resolveBranchDeps(tree.package, deps).then(
-    () => finished(), finished
-  )
-
-  function resolveBranchDeps (pkg, deps) {
-    return BB.resolve(null).then(() => {
-      var allDependencies = Object.keys(deps).map((dep) => {
-        return npa.resolve(dep, deps[dep])
-      }).filter((dep) => {
-        return dep.registry &&
-               !seen[dep.toString()] &&
-               !findRequirement(tree, dep.name, dep)
-      })
-      if (skipOptional) {
-        var optDeps = pkg.optionalDependencies || {}
-        allDependencies = allDependencies.filter((dep) => !optDeps[dep.name])
-      }
-      return BB.map(allDependencies, (dep) => {
-        seen[dep.toString()] = true
-        return fpm(dep, '', {tracker: log.newItem('fetchMetadata')}).then(
-          (pkg) => {
-            return pkg && pkg.dependencies && resolveBranchDeps(pkg, pkg.dependencies)
-          },
-          () => null
-        )
-      })
-    })
-  }
-}
-
-// Load any missing dependencies in the given tree
-exports.loadDeps = loadDeps
-function loadDeps (tree, log, next) {
-  validate('OOF', arguments)
-  if (tree.loaded || (tree.parent && tree.parent.failed) || tree.removed) return andFinishTracker.now(log, next)
-  if (tree.parent) tree.loaded = true
-  if (!tree.package.dependencies) tree.package.dependencies = {}
-  asyncMap(Object.keys(tree.package.dependencies), function (dep, done) {
-    var version = tree.package.dependencies[dep]
-    if (tree.package.optionalDependencies &&
-        tree.package.optionalDependencies[dep] &&
-        !npm.config.get('optional')) {
-      return done()
-    }
-
-    addDependency(dep, version, tree, log.newGroup('loadDep:' + dep), andHandleOptionalErrors(log, tree, dep, done))
-  }, andForEachChild(loadDeps, andFinishTracker(log, next)))
-}
-
-// Load development dependencies into the given tree
-exports.loadDevDeps = function (tree, log, next) {
-  validate('OOF', arguments)
-  if (!tree.package.devDependencies) return andFinishTracker.now(log, next)
-  // if any of our prexisting children are from a shrinkwrap then we skip
-  // loading dev deps as the shrinkwrap will already have provided them for us.
-  if (tree.children.some(function (child) { return child.shrinkwrapDev })) {
-    return andFinishTracker.now(log, next)
-  }
-  asyncMap(Object.keys(tree.package.devDependencies), function (dep, done) {
-    // things defined as both dev dependencies and regular dependencies are treated
-    // as the former
-    if (tree.package.dependencies[dep]) return done()
-
-    var logGroup = log.newGroup('loadDevDep:' + dep)
-    addDependency(dep, tree.package.devDependencies[dep], tree, logGroup, done)
-  }, andForEachChild(loadDeps, andFinishTracker(log, next)))
-}
-
-var loadExtraneous = exports.loadExtraneous = function (tree, log, next) {
-  var seen = {}
-
-  function loadExtraneous (tree) {
-    if (seen[tree.path]) return
-    seen[tree.path] = true
-    for (var child of tree.children) {
-      if (child.loaded) continue
-      resolveWithExistingModule(child, tree)
-      loadExtraneous(child)
-    }
-  }
-  loadExtraneous(tree)
-  log.finish()
-  next()
-}
-
-exports.loadExtraneous.andResolveDeps = function (tree, log, next) {
-  validate('OOF', arguments)
-  // For canonicalized trees (eg from shrinkwrap) we don't want to bother
-  // resolving the dependencies of extraneous deps.
-  if (tree.loaded) return loadExtraneous(tree, log, next)
-  asyncMap(tree.children.filter(function (child) { return !child.loaded }), function (child, done) {
-    resolveWithExistingModule(child, tree)
-    done(null, child, log)
-  }, andForEachChild(loadDeps, andFinishTracker(log, next)))
-}
-
-function addDependency (name, versionSpec, tree, log, done) {
-  validate('SSOOF', arguments)
-  var next = andAddParentToErrors(tree, done)
-  try {
-    var req = childDependencySpecifier(tree, name, versionSpec)
-  } catch (err) {
-    return done(err)
-  }
-  var child = findRequirement(tree, name, req)
-  if (child) {
-    resolveWithExistingModule(child, tree)
-    if (child.package._shrinkwrap === undefined) {
-      readShrinkwrap.andInflate(child, function (er) { next(er, child, log) })
-    } else {
-      next(null, child, log)
-    }
-  } else {
-    fetchPackageMetadata(req, packageRelativePath(tree), {tracker: log.newItem('fetchMetadata')}, iferr(next, function (pkg) {
-      resolveWithNewModule(pkg, tree, log, next)
-    }))
-  }
-}
-
-function resolveWithExistingModule (child, tree) {
-  validate('OO', arguments)
-  addRequiredDep(tree, child)
-  if (tree.parent && child.parent !== tree) updatePhantomChildren(tree.parent, child)
-}
-
-var updatePhantomChildren = exports.updatePhantomChildren = function (current, child) {
-  validate('OO', arguments)
-  while (current && current !== child.parent) {
-    if (!current.phantomChildren) current.phantomChildren = {}
-    current.phantomChildren[moduleName(child)] = child
-    current = current.parent
-  }
-}
-
-exports._replaceModuleByPath = replaceModuleByPath
-function replaceModuleByPath (obj, key, child) {
-  return replaceModule(obj, key, child, function (replacing, child) {
-    return replacing.path === child.path
-  })
-}
-
-exports._replaceModuleByName = replaceModuleByName
-function replaceModuleByName (obj, key, child) {
-  var childName = moduleName(child)
-  return replaceModule(obj, key, child, function (replacing, child) {
-    return moduleName(replacing) === childName
-  })
-}
-
-function replaceModule (obj, key, child, matchBy) {
-  validate('OSOF', arguments)
-  if (!obj[key]) obj[key] = []
-  // we replace children with a new array object instead of mutating it
-  // because mutating it results in weird failure states.
-  // I would very much like to know _why_ this is. =/
-  var children = [].concat(obj[key])
-  for (var replaceAt = 0; replaceAt < children.length; ++replaceAt) {
-    if (matchBy(children[replaceAt], child)) break
-  }
-  var replacing = children.splice(replaceAt, 1, child)
-  obj[key] = children
-  return replacing[0]
-}
-
-function resolveWithNewModule (pkg, tree, log, next) {
-  validate('OOOF', arguments)
-
-  log.silly('resolveWithNewModule', packageId(pkg), 'checking installable status')
-  return isInstallable(pkg, iferr(next, function () {
-    addBundled(pkg, iferr(next, function () {
-      var parent = earliestInstallable(tree, tree, pkg) || tree
-      var isLink = pkg._requested.type === 'directory'
-      var child = createChild({
-        package: pkg,
-        parent: parent,
-        path: path.join(parent.isLink ? parent.realpath : parent.path, 'node_modules', pkg.name),
-        realpath: isLink ? pkg._requested.fetchSpec : path.join(parent.realpath, 'node_modules', pkg.name),
-        children: pkg._bundled || [],
-        isLink: isLink,
-        isInLink: parent.isLink,
-        knownInstallable: true
-      })
-      delete pkg._bundled
-      var hasBundled = child.children.length
-
-      var replaced = replaceModuleByName(parent, 'children', child)
-      if (replaced) removeObsoleteDep(replaced)
-      addRequiredDep(tree, child)
-      child.location = flatNameFromTree(child)
-
-      if (tree.parent && parent !== tree) updatePhantomChildren(tree.parent, child)
-
-      if (hasBundled) {
-        inflateBundled(child, child, child.children)
-      }
-
-      if (pkg._shrinkwrap && pkg._shrinkwrap.dependencies) {
-        return inflateShrinkwrap(child, pkg._shrinkwrap.dependencies, function (er) {
-          next(er, child, log)
-        })
-      }
-      next(null, child, log)
-    }))
-  }))
-}
-
-var validatePeerDeps = exports.validatePeerDeps = function (tree, onInvalid) {
-  if (!tree.package.peerDependencies) return
-  Object.keys(tree.package.peerDependencies).forEach(function (pkgname) {
-    var version = tree.package.peerDependencies[pkgname]
-    var match = findRequirement(tree.parent || tree, pkgname, npa.resolve(pkgname, version))
-    if (!match) onInvalid(tree, pkgname, version)
-  })
-}
-
-exports.validateAllPeerDeps = function (tree, onInvalid) {
-  validateAllPeerDeps(tree, onInvalid, {})
-}
-
-function validateAllPeerDeps (tree, onInvalid, seen) {
-  validate('OFO', arguments)
-  if (seen[tree.path]) return
-  seen[tree.path] = true
-  validatePeerDeps(tree, onInvalid)
-  tree.children.forEach(function (child) { validateAllPeerDeps(child, onInvalid, seen) })
-}
-
-// Determine if a module requirement is already met by the tree at or above
-// our current location in the tree.
-var findRequirement = exports.findRequirement = function (tree, name, requested, requestor) {
-  validate('OSO', [tree, name, requested])
-  if (!requestor) requestor = tree
-  var nameMatch = function (child) {
-    return moduleName(child) === name && child.parent && !child.removed && !child.failed
-  }
-  var versionMatch = function (child) {
-    return doesChildVersionMatch(child, requested, requestor)
-  }
-  if (nameMatch(tree)) {
-    // this *is* the module, but it doesn't match the version, so a
-    // new copy will have to be installed
-    return versionMatch(tree) ? tree : null
+Glob.prototype._stat2 = function (f, abs, er, stat, cb) {
+  if (er && (er.code === 'ENOENT' || er.code === 'ENOTDIR')) {
+    this.statCache[abs] = false
+    return cb()
   }
 
-  var matches = tree.children.filter(nameMatch)
-  if (matches.length) {
-    matches = matches.filter(versionMatch)
-    // the module exists as a dependent, but the version doesn't match, so
-    // a new copy will have to be installed above here
-    if (matches.length) return matches[0]
-    return null
-  }
-  if (tree.isTop) return null
-  return findRequirement(tree.parent, name, requested, requestor)
-}
+  var needDir = f.slice(-1) === '/'
+  this.statCache[abs] = stat
 
-function preserveSymlinks () {
-  if (!('NODE_PRESERVE_SYMLINKS' in process.env)) return false
-  const value = process.env.NODE_PRESERVE_SYMLINKS
-  if (value == null || value === '' || value === 'false' || value === 'no' || value === '0') return false
-  return true
-}
+  if (abs.slice(-1) === '/' && stat && !stat.isDirectory())
+    return cb(null, false, stat)
 
-// Find the highest level in the tree that we can install this module in.
-// If the module isn't installed above us yet, that'd be the very top.
-// If it is, then it's the level below where its installed.
-var earliestInstallable = exports.earliestInstallable = function (requiredBy, tree, pkg) {
-  validate('OOO', arguments)
-  function undeletedModuleMatches (child) {
-    return !child.removed && moduleName(child) === pkg.name
-  }
-  if (tree.children.some(undeletedModuleMatches)) return null
+  var c = true
+  if (stat)
+    c = stat.isDirectory() ? 'DIR' : 'FILE'
+  this.cache[abs] = this.cache[abs] || c
 
-  // If any of the children of this tree have conflicting
-  // binaries then we need to decline to install this package here.
-  var binaryMatches = pkg.bin && tree.children.some(function (child) {
-    if (child.removed || !child.package.bin) return false
-    return Object.keys(child.package.bin).some(function (bin) {
-      return pkg.bin[bin]
-    })
-  })
+  if (needDir && c === 'FILE')
+    return cb()
 
-  if (binaryMatches) return null
-
-  // if this tree location requested the same module then we KNOW it
-  // isn't compatible because if it were findRequirement would have
-  // found that version.
-  var deps = tree.package.dependencies || {}
-  if (!tree.removed && requiredBy !== tree && deps[pkg.name]) {
-    return null
-  }
-
-  var devDeps = tree.package.devDependencies || {}
-  if (tree.isTop && devDeps[pkg.name]) {
-    var requested = childDependencySpecifier(tree, pkg.name, devDeps[pkg.name])
-    if (!doesChildVersionMatch({package: pkg}, requested, tree)) {
-      return null
-    }
-  }
-
-  if (tree.phantomChildren && tree.phantomChildren[pkg.name]) return null
-
-  if (tree.isTop) return tree
-  if (tree.isGlobal) return tree
-
-  if (npm.config.get('global-style') && tree.parent.isTop) return tree
-  if (npm.config.get('legacy-bundling')) return tree
-
-  if (!preserveSymlinks() && /^[.][.][\\/]/.test(path.relative(tree.parent.realpath, tree.realpath))) return tree
-
-  return (earliestInstallable(requiredBy, tree.parent, pkg) || tree)
+  return cb(null, c, stat)
 }
